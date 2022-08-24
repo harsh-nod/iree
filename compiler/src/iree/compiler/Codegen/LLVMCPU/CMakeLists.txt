@@ -20,6 +20,7 @@ iree_cc_library(
     "KernelDispatch.cpp"
     "LLVMCPUAArch64VectorLowering.cpp"
     "LLVMCPUCheckIRBeforeLLVMConversion.cpp"
+    "LLVMCPUCreateFastSlowPath.cpp"
     "LLVMCPUPadTile.cpp"
     "LLVMCPUVectorizePad.cpp"
     "LLVMCPUEmitVectorizationRemarks.cpp"
