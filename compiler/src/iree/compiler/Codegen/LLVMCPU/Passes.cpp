@@ -503,6 +503,7 @@ void addConvTileAndDecomposeExpertPassPipeline(OpPassManager &passManager) {
     nestedModulePM.addNestedPass<func::FuncOp>(createCSEPass());
   }
 
+  nestedModulePM.addNestedPass<func::FuncOp>(createLLVMCPUCreateFastSlowPathPass());
   nestedModulePM.addNestedPass<func::FuncOp>(createLLVMCPUPadTilePass());
   nestedModulePM.addNestedPass<func::FuncOp>(createLLVMCPUVectorizePadPass());
 

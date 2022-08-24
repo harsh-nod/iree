@@ -222,6 +222,9 @@ createLLVMCPUPadTilePass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createLLVMCPUVectorizePadPass();
 
+std::unique_ptr<OperationPass<func::FuncOp>>
+createLLVMCPUCreateFastSlowPathPass();
+
 //------------------------------------------------------------------------------
 // LLVMCPU Codegen specific patterns.
 //------------------------------------------------------------------------------

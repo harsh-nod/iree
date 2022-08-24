@@ -283,6 +283,12 @@ def LLVMCPUPadTile :
   let constructor = "mlir::iree_compiler::createLLVMCPUPadTilePass()";
 }
 
+def LLVMCPUCreateFastSlowPath :
+    Pass<"iree-llvmcpu-create-fast-slow-path", "func::FuncOp"> {
+  let summary = "Create separate fast and slow paths to handle padding";
+  let constructor = "mlir::iree_compiler::createLLVMCPUCreateFastSlowPathPass()";
+}
+
 //------------------------------------------------------------------------------
 // LLVMGPU
 //------------------------------------------------------------------------------
