@@ -75,6 +75,9 @@ std::unique_ptr<Pass> createCleanupNumericNarrowingPass();
 // linalg.matmul
 std::unique_ptr<Pass> createConvertConv2D1x1ToMatmulPass();
 
+std::unique_ptr<Pass> createHorizontalFusionPass();
+std::unique_ptr<Pass> createBringMatmulsTogetherPass();
+
 // Creates a pass to convert linalg convolution ops into linalg.matmul ops
 // using im2col tranformation.
 std::unique_ptr<Pass> createConvertConv2DToImg2ColPass();

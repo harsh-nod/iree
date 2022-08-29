@@ -206,6 +206,10 @@ void buildFlowTransformPassPipeline(OpPassManager &passManager,
 
   passManager.addPass(mlir::createLinalgNamedOpConversionPass());
 
+  passManager.addPass(mlir::createCSEPass());
+  passManager.addPass(IREE::Flow::createBringMatmulsTogetherPass());
+  passManager.addPass(IREE::Flow::createHorizontalFusionPass());
+
   // Expand tensor shapes into SSA values and optimize the whole program.
   // The more we are able to equate shape dimensions at this level the better
   // our fusions will be.

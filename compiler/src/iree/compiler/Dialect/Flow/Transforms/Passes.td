@@ -32,6 +32,18 @@ def ConvertConv2D1x1ConvToMatmul :
   let constructor = "mlir::iree_compiler::IREE::Flow::createConvertConv2D1x1ToMatmulPass()";
 }
 
+def HorizontalFusion :
+    Pass<"iree-flow-apply-horizontal-fusion", ""> {
+  let summary = "Fuse ops horizontally";
+  let constructor = "mlir::iree_compiler::IREE::Flow::createHorizontalFusionPass()";
+}
+
+def BringMatmulsTogether :
+    Pass<"iree-flow-bring-matmuls-together", ""> {
+  let summary = "Fuse ops horizontally";
+  let constructor = "mlir::iree_compiler::IREE::Flow::createBringMatmulsTogetherPass()";
+}
+
 def ConvertConv2DToImg2Col :
     Pass<"iree-flow-convert-conv2d-to-img2col", ""> {
   let summary = "Convert linalg convolution ops to matmul img2col based implementation";
