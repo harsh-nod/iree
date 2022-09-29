@@ -264,6 +264,7 @@ void buildFlowTransformPassPipeline(OpPassManager &passManager,
       // transpose.
       .addPredicatedPass(clNormalizeInputIndexingMap,
                          createInterchangeTransposeGenericOpsPass)
+      .addPass(createPartitionLinalgOpsUsingAnnotationsPass)
       ////////////////////////////////////////////////////////////////////////
       // Dispatch region formation.
       .addPredicatedPass(!clDispatchTransformFileName.empty(),
