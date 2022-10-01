@@ -176,6 +176,10 @@ static LogicalResult convertToDispatchOp(DispatchWorkgroupsOp regionOp,
     regionOp.getResult(i).replaceAllUsesWith(dispatchOp.getResult(i));
   }
 
+  // Add device annotations
+  if (regionOp->hasAttr("device"))
+    dispatchOp->setAttr("device", regionOp->getAttr("device"));
+
   // Erase original region.
   regionOp.erase();
 

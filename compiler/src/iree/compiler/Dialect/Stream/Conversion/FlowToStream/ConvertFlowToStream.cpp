@@ -303,11 +303,22 @@ struct ConvertDispatchOp : public OpConversionPattern<IREE::Flow::DispatchOp> {
       }
     }
 
-    rewriter.replaceOpWithNewOp<IREE::Stream::AsyncDispatchOp>(
+    Attribute device;
+    bool hasDevice{false};
+    if (op->hasAttr("device")) {
+      device = op->getAttr("device");
+      hasDevice = true;
+    }
+
+    auto asyncOp = rewriter.replaceOpWithNewOp<IREE::Stream::AsyncDispatchOp>(
         op, resultTypes, adaptor.getWorkload(), adaptor.getEntryPoint(),
         dispatchOperands, dispatchOperandSizes, resultSizes,
         adaptor.getTiedOperandsAttr(),
         /*affinity=*/nullptr);
+
+    if (hasDevice)
+      asyncOp->setAttr("device", device);
+
     return success();
   }
 };
