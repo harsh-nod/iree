@@ -537,6 +537,7 @@ Optional<SmallVector<int64_t>> getWmmaNativeVectorSize(Operation *op) {
     return nativeSize;
   }
   if (auto writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
+    if (writeOp.getVectorType().getRank() < 2) return std::nullopt;
     SmallVector<int64_t> nativeSize(writeOp.getVectorType().getRank() - 2, 1);
     nativeSize.append({m, n});
     return nativeSize;
@@ -556,6 +557,7 @@ Optional<SmallVector<int64_t>> getWmmaNativeVectorSize(Operation *op) {
   }
   if ((OpTrait::hasElementwiseMappableTraits(op) && op->getNumResults() == 1)) {
     if (auto vecType = op->getResultTypes()[0].dyn_cast<VectorType>()) {
+      if (vecType.getRank() < 2) return std::nullopt;
       SmallVector<int64_t> nativeSize(vecType.getRank() - 2, 1);
       // Map elementwise ops to the output shape.
       nativeSize.append({m, n});

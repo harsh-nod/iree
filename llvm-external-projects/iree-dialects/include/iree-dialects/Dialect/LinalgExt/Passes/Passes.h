@@ -178,6 +178,9 @@ std::unique_ptr<Pass> createDecomposeSoftmaxPass();
 
 // Creates a pass to convert the attention op into a sequence of
 // linalg ops.
+SmallVector<Operation *>
+tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
+                          IRRewriter &rewriter);
 std::unique_ptr<Pass> createTileAndDecomposeAttentionPass();
 
 // Marker used as attribute the depth of the split reduction transformations.

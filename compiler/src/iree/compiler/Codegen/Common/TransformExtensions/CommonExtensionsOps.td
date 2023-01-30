@@ -54,7 +54,7 @@ def ApplyPatternsOp : Op<Transform_Dialect, "iree.apply_patterns",
       with minor identity permutations.
       - rank_reducing_linalg: adds patterns that results in rank-reducing
       behavior on subset-based linalg operations.
-      - rank_reducing_vector: adds patterns that results in rank-reducing 
+      - rank_reducing_vector: adds patterns that results in rank-reducing
       behavior on subset-based vector operations.
       - expand_memref_strided_metadata: adds patterns that expand memref
       operations into extract_strided_metadata operations and a materialization
@@ -281,34 +281,34 @@ def ShareForeachThreadOperandsOp : Op<
     Transform_Dialect, "iree.share_foreach_thread_operands", [
       FunctionalStyleTransformOpTrait,
       MemoryEffectsOpInterface,
-      TransformEachOpTrait,
-      TransformOpInterface]> {
+      TransformOpInterface,
+      TransformEachOpTrait]> {
   let description = [{
-    Target a single scf.foreach_thread op and shares all uses of the specified 
+    Target a single scf.foreach_thread op and shares all uses of the specified
     `share_operands` operand indices.
 
     Sharing can be thought of as the inverse of traditional privatization.
     Privatization consists in determining that a part of memory is only accessed
-    by a single thread to and subsequently slicing out that part into a 
+    by a single thread to and subsequently slicing out that part into a
     thread_private storage that has smaller footprint, better locality and better
     alignment properties.
-    In the case of scf.foreach_thread on tensors, tensor values are immutable 
+    In the case of scf.foreach_thread on tensors, tensor values are immutable
     and the same tensor value may be passed as `shared_outs` and also captured
     for internal uses.
-    Due to the immutability property, the whole tensor values are private by 
+    Due to the immutability property, the whole tensor values are private by
     construction and result in alloc + copy of the whole tensor on every thread
-    to maintain the original SSA value after bufferizing. 
+    to maintain the original SSA value after bufferizing.
 
     An analysis similar to privatization is needed to ensure that only a private
     slice is needed and that the whole tensor can be shared.
-    This transformation amounts to injecting the result of such an analysis as 
+    This transformation amounts to injecting the result of such an analysis as
     static information in the program.
     The transformation checks that the values captured are `tensor.extract_slice`
     with a matching `tensor.parallel_insert_slice`, to approximate the lack of
-    a cross-thread dependence analysis. 
+    a cross-thread dependence analysis.
     However this can still be unsafe wrt parallelism so use carefully!
 
-    Sharing consists in rewriting all uses of the operands passed as 
+    Sharing consists in rewriting all uses of the operands passed as
     `shared_outs` that are also captured wihtin the `scf.foreach_thread` region
     into the matching `shared_outs` bbarg.
 
@@ -319,7 +319,7 @@ def ShareForeachThreadOperandsOp : Op<
     #### Return modes
 
     If any of the `share_operands` indices overflow, a definite error is produced.
-    
+
     If a `share_operands` fails a sharing precondition, it is ignored.
     In the future, we should emit a notification.
 
@@ -473,6 +473,40 @@ def ApplyBufferOptimizationsOp :
   let extraClassDeclaration = [{
     ::mlir::DiagnosedSilenceableFailure applyToOne(
         ::mlir::Operation *target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+}
+
+def TileAndDecomposeAttentionOp : Op<Transform_Dialect, "iree.tile_and_decompose_attention",
+    [FunctionalStyleTransformOpTrait,
+     MemoryEffectsOpInterface,
+     TransformOpInterface,
+     TransformEachOpTrait]> {
+  let description = [{
+    Target iree_linalg_ext.attention ops and tile and decompose them.
+    This transform consumes the target handle and produces a result handle.
+  }];
+
+  let arguments = (
+      ins PDL_Operation:$target
+  );
+  let results = (outs Variadic<PDL_Operation>:$result);
+
+  let assemblyFormat = "attr-dict $target";
+  let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
+
+  let builders = [
+    OpBuilder<(ins "Value":$target)>
+  ];
+
+  let assemblyFormat = [{
+    $target attr-dict `:` functional-type(operands, results)
+  }];
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::iree_compiler::IREE::LinalgExt::AttentionOp target,
         ::mlir::transform::ApplyToEachResultList &results,
         ::mlir::transform::TransformState &state);
   }];

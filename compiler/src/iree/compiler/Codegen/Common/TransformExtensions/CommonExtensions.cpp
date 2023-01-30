@@ -7,6 +7,7 @@
 #include "CommonExtensions.h"
 
 #include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree-dialects/Dialect/LinalgExt/Passes/Passes.h"
 #include "iree-dialects/Dialect/LinalgTransform/SimplePatternRewriter.h"
 #include "iree-dialects/Dialect/LinalgTransform/StructuredTransformOpsExt.h"
 #include "iree-dialects/Transforms/ListenerGreedyPatternRewriteDriver.h"
@@ -14,6 +15,7 @@
 #include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Codegen/Interfaces/BufferizationInterfaces.h"
 #include "iree/compiler/Codegen/Passes.h"
+#include "iree/compiler/Codegen/Utils/MarkerUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/Flow/IR/FlowOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
@@ -884,7 +886,8 @@ static LogicalResult gpuComprehensiveBufferizeCopyFn(OpBuilder &builder,
   // post-bufferization copies do not trigger properly.
   // So we keep using `createLinalgCopyOp` which builds a GenericOp.
   // builder.create<linalg::CopyOp>(loc, from, to);
-  mlir::iree_compiler::createLinalgCopyOp(builder, loc, from, to);
+  auto copy = mlir::iree_compiler::createLinalgCopyOp(builder, loc, from, to);
+  setMarker(copy, getCopyToWorkgroupMemoryMarker());
   return success();
 }
 
@@ -1205,6 +1208,22 @@ void transform_dialect::ApplyBufferOptimizationsOp::build(
     OpBuilder &builder, OperationState &result, Value target) {
   result.addOperands(target);
   result.addTypes({pdl::OperationType::get(target.getContext())});
+}
+
+//===---------------------------------------------------------------------===//
+// TileAndDecomposeAttention
+//===---------------------------------------------------------------------===//
+
+DiagnosedSilenceableFailure
+transform_dialect::TileAndDecomposeAttentionOp::applyToOne(
+    IREE::LinalgExt::AttentionOp attentionOp,
+    transform::ApplyToEachResultList &results,
+    transform::TransformState &state) {
+  IRRewriter rewriter(getContext());
+  SmallVector<Operation *> ops =
+      LinalgExt::tileAndDecomposeAttention(attentionOp, rewriter);
+  for (auto op : ops) results.push_back(op);
+  return DiagnosedSilenceableFailure::success();
 }
 
 #define GET_OP_CLASSES

@@ -382,6 +382,7 @@ static void addLowerToLLVMGPUPasses(OpPassManager &pm, bool useROCM) {
 
   // Linalg -> SCF
   pm.addNestedPass<func::FuncOp>(createMemrefCopyToLinalgPass());
+  pm.addNestedPass<func::FuncOp>(createGPUDistributeSharedMemoryCopy());
   pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   pm.addNestedPass<func::FuncOp>(createCSEPass());
