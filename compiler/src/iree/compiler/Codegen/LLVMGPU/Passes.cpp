@@ -377,6 +377,10 @@ static void addLowerToLLVMGPUPasses(OpPassManager &pm, bool useROCM) {
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
 
+  pm.addNestedPass<func::FuncOp>(createHoistOutputPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+
   // LinalgExt -> SCF
   pm.addNestedPass<func::FuncOp>(IREE::LinalgExt::createLinalgExtToLoopsPass());
 
@@ -386,6 +390,14 @@ static void addLowerToLLVMGPUPasses(OpPassManager &pm, bool useROCM) {
   pm.addNestedPass<func::FuncOp>(createConvertLinalgToLoopsPass());
   pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
   pm.addNestedPass<func::FuncOp>(createCSEPass());
+
+  pm.addNestedPass<func::FuncOp>(createLLVMGPUVectorToGPU());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
+
+  // Pipeline memory operations.
+  //pm.addNestedPass<func::FuncOp>(
+  //    createGPUPipeliningPass(/*epiloguePeeling=*/false, 2));
 
   // Pad allocations with dynamic dimension before lowering of SCF and affine
   // but after linalg lowering.

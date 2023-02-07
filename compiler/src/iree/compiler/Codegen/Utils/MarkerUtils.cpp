@@ -46,6 +46,10 @@ StringRef getVectorizeMarker() { return "vectorize"; }
 
 StringRef getDeleteMarker() { return "delete"; }
 
+StringRef getAlignedCopyMarker() { return "aligned_copy"; }
+
+StringRef getNonAlignedCopyMarker() { return "non_aligned_copy"; }
+
 StringRef getMarkerOrNull(Operation *op) {
   StringAttr attr = op->getAttrOfType<StringAttr>(
       IREE::LinalgExt::LinalgTransforms::kLinalgTransformMarker);

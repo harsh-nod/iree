@@ -107,7 +107,7 @@ static void populateTilingCopyToWorkgroupMemPatterns(
       tilingOptions,
       IREE::LinalgExt::LinalgTransformationFilter(
           {StringAttr::get(patterns.getContext(),
-                           getCopyToWorkgroupMemoryMarker())},
+                           getNonAlignedCopyMarker())},
           StringAttr::get(patterns.getContext(), getVectorizeMarker())));
 }
 
@@ -166,7 +166,7 @@ static void populateTileToUnroll(RewritePatternSet &patterns,
       tilingOptions,
       IREE::LinalgExt::LinalgTransformationFilter(
           {StringAttr::get(patterns.getContext(),
-                           getCopyToWorkgroupMemoryMarker())},
+                           getAlignedCopyMarker())},
           StringAttr::get(patterns.getContext(), kCopyToDistribute)));
 }
 
@@ -259,7 +259,7 @@ static void populateVectorizationPatterns(RewritePatternSet &patterns) {
       patterns, IREE::LinalgExt::LinalgVectorizationOptions(),
       IREE::LinalgExt::LinalgTransformationFilter(
           {StringAttr::get(patterns.getContext(),
-                           getCopyToWorkgroupMemoryMarker()),
+                           getAlignedCopyMarker()),
            StringAttr::get(patterns.getContext(), kCopyDistributed)},
           std::nullopt));
 }
@@ -343,6 +343,74 @@ static void UnrollSharedMemoryLoops(
   }
 }
 
+static LogicalResult distributeAlignedCopies(MLIRContext *context, int64_t flatWorkgroupSize, ArrayRef<int64_t> workgroupSize,
+                                             func::FuncOp funcOp) {
+  // Ignore all the exisiting loop
+  llvm::SmallDenseSet<scf::ForOp> loopsToIgnore;
+  funcOp.walk([&](scf::ForOp loop) { loopsToIgnore.insert(loop); });
+
+  // Step 1. tile copies to get to a shape that can be distributed to
+  // 128bits per lane copies.
+  RewritePatternSet serialTilingPatterns(context);
+  populateTileToUnroll(serialTilingPatterns, flatWorkgroupSize);
+  if (failed(applyPatternsAndFoldGreedily(
+          funcOp, std::move(serialTilingPatterns)))) {
+    return failure();
+  }
+  debugPrint(funcOp, "After step 1: tiling");
+
+  // Calculate a flat id that will then be broken down during distribution.
+  Value flatId = createFlatId(funcOp, workgroupSize);
+  // Step 2. Distribute the linalg op onto threads.
+  RewritePatternSet tileAndDistributePatterns(context);
+  populateTilingAndDistribute(tileAndDistributePatterns, flatId);
+  if (failed(applyPatternsAndFoldGreedily(
+          funcOp, std::move(tileAndDistributePatterns)))) {
+    return failure();
+  }
+  debugPrint(funcOp, "After step 2: thread distribution");
+
+  // Step 3. Vectorize the distributed copies.
+  RewritePatternSet vectorizationPatterns(context);
+  populateVectorizationPatterns(vectorizationPatterns);
+  if (failed(applyPatternsAndFoldGreedily(
+          funcOp, std::move(vectorizationPatterns)))) {
+    return failure();
+  }
+  debugPrint(funcOp, "After step 3: vectorization");
+
+  // Step4. Finally unroll all the loop created
+  UnrollSharedMemoryLoops(funcOp, loopsToIgnore);
+  debugPrint(funcOp, "After step 4: unrolling");
+  return success();
+}
+
+static LogicalResult distributeNonAlignedCopies(MLIRContext *context, ArrayRef<int64_t> workgroupSize, func::FuncOp funcOp) {
+  // Fall back to basic tiling for cases where workgroup memory size is not
+  // well aligned on the number of threads.
+  // TODO(thomasraoux): Handle this case with padding instead so that we get
+  // good performance for more complex shapes.
+  RewritePatternSet threadLevelTilingPatterns(context);
+  populateTilingCopyToWorkgroupMemPatterns(threadLevelTilingPatterns,
+                                           workgroupSize);
+  if (failed(applyPatternsAndFoldGreedily(
+          funcOp, std::move(threadLevelTilingPatterns)))) {
+    return failure();
+  }
+  debugPrint(funcOp, "After tiling for unaligned case");
+
+  // Apply canonicalization patterns.
+  RewritePatternSet threadTilingCanonicalizationPatterns =
+      linalg::getLinalgTilingCanonicalizationPatterns(context);
+  populateAffineMinSCFCanonicalizationPattern(
+      threadTilingCanonicalizationPatterns);
+  if (failed(applyPatternsAndFoldGreedily(
+          funcOp, std::move(threadTilingCanonicalizationPatterns)))) {
+    return failure();
+  }
+  return success();
+}
+
 namespace {
 
 class GPUDistributeSharedMemoryCopyPass
@@ -369,82 +437,27 @@ class GPUDistributeSharedMemoryCopyPass
     hoistAlloc(funcOp);
     removeRedundantBarriers(funcOp);
 
+    // Step 1. Split copies into aligned and non-aligned
     int64_t flatWorkgroupSize =
         workgroupSize[0] * workgroupSize[1] * workgroupSize[2];
-    bool isAligned = llvm::all_of(
-        copiesToWorkgroupMem, [flatWorkgroupSize](linalg::GenericOp copyOp) {
-          MemRefType dstMemRefType =
-              copyOp.getDpsInitOperand(0)->get().getType().cast<MemRefType>();
-          auto shape = dstMemRefType.getShape();
-          int targetVectorSize =
-              copyVectorNumBits / dstMemRefType.getElementTypeBitWidth();
-          return canPerformVectorAccessUsingAllThreads(shape, flatWorkgroupSize,
-                                                       targetVectorSize);
-        });
-    debugPrint(funcOp, "After initial IR cleanup");
-
-    if (isAligned) {
-      // Ignore all the exisiting loop
-      llvm::SmallDenseSet<scf::ForOp> loopsToIgnore;
-      funcOp.walk([&](scf::ForOp loop) { loopsToIgnore.insert(loop); });
-
-      // Step 1. tile copies to get to a shape that can be distributed to
-      // 128bits per lane copies.
-      RewritePatternSet serialTilingPatterns(context);
-      populateTileToUnroll(serialTilingPatterns, flatWorkgroupSize);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(serialTilingPatterns)))) {
-        return signalPassFailure();
-      }
-      debugPrint(funcOp, "After step 1: tiling");
-
-      // Calculate a flat id that will then be broken down during distribution.
-      Value flatId = createFlatId(funcOp, workgroupSize);
-      // Step 2. Distribute the linalg op onto threads.
-      RewritePatternSet tileAndDistributePatterns(context);
-      populateTilingAndDistribute(tileAndDistributePatterns, flatId);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(tileAndDistributePatterns)))) {
-        return signalPassFailure();
-      }
-      debugPrint(funcOp, "After step 2: thread distribution");
-
-      // Step 3. Vectorize the distributed copies.
-      RewritePatternSet vectorizationPatterns(context);
-      populateVectorizationPatterns(vectorizationPatterns);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(vectorizationPatterns)))) {
-        return signalPassFailure();
-      }
-      debugPrint(funcOp, "After step 3: vectorization");
-
-      // Step4. Finally unroll all the loop created
-      UnrollSharedMemoryLoops(funcOp, loopsToIgnore);
-      debugPrint(funcOp, "After step 4: unrolling");
-    } else {
-      // Fall back to basic tiling for cases where workgroup memory size is not
-      // well aligned on the number of threads.
-      // TODO(thomasraoux): Handle this case with padding instead so that we get
-      // good performance for more complex shapes.
-      RewritePatternSet threadLevelTilingPatterns(context);
-      populateTilingCopyToWorkgroupMemPatterns(threadLevelTilingPatterns,
-                                               workgroupSize);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(threadLevelTilingPatterns)))) {
-        return signalPassFailure();
-      }
-      debugPrint(funcOp, "After tiling for unaligned case");
-
-      // Apply canonicalization patterns.
-      RewritePatternSet threadTilingCanonicalizationPatterns =
-          linalg::getLinalgTilingCanonicalizationPatterns(context);
-      populateAffineMinSCFCanonicalizationPattern(
-          threadTilingCanonicalizationPatterns);
-      if (failed(applyPatternsAndFoldGreedily(
-              funcOp, std::move(threadTilingCanonicalizationPatterns)))) {
-        return signalPassFailure();
+    for (linalg::GenericOp copyOp : copiesToWorkgroupMem) {
+      MemRefType dstMemRefType =
+          copyOp.getDpsInitOperand(0)->get().getType().cast<MemRefType>();
+      auto shape = dstMemRefType.getShape();
+      int targetVectorSize =
+          copyVectorNumBits / dstMemRefType.getElementTypeBitWidth();
+      if (canPerformVectorAccessUsingAllThreads(shape, flatWorkgroupSize, targetVectorSize)) {
+        setMarker(copyOp, getAlignedCopyMarker());
+      } else {
+        setMarker(copyOp, getNonAlignedCopyMarker());
       }
     }
+
+    debugPrint(funcOp, "After initial IR cleanup");
+
+    (void)distributeAlignedCopies(context, flatWorkgroupSize, workgroupSize, funcOp);
+    (void)distributeNonAlignedCopies(context, workgroupSize, funcOp);
+
   }
 };
 

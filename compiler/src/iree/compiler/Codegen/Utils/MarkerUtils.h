@@ -49,6 +49,12 @@ StringRef getVectorizeMarker();
 /// a marker that can be used later to delete these operations.
 StringRef getDeleteMarker();
 
+/// Marker to indicate aligned copy
+StringRef getAlignedCopyMarker();
+
+/// Marker to indicate non-aligned copy
+StringRef getNonAlignedCopyMarker();
+
 /// Returns the marker set on an operation, or "" if no marker is set.
 StringRef getMarkerOrNull(Operation *op);
 

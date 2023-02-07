@@ -454,6 +454,12 @@ def LLVMGPUDistribute :
   let constructor = "mlir::iree_compiler::createLLVMGPUDistribute()";
 }
 
+def HoistOutput :
+    Pass<"iree-llvmgpu-hoist-output", "func::FuncOp"> {
+  let summary = "Pass to hoist output.";
+  let constructor = "mlir::iree_compiler::createHoistOutputPass()";
+}
+
 def LLVMGPUTensorAlloc :
     Pass<"iree-llvmgpu-alloc", "func::FuncOp"> {
   let summary = "Pass to create allocation for some values.";

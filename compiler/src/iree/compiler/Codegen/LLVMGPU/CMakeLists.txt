@@ -19,6 +19,7 @@ iree_cc_library(
     "TilingUtils.h"
     "TransposeUtils.h"
   SRCS
+    "HoistOutput.cpp"
     "ConvertToLLVM.cpp"
     "ConvertToNVVM.cpp"
     "ConvertToROCDL.cpp"

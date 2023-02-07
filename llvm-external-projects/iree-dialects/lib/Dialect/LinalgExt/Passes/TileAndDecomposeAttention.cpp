@@ -11,6 +11,7 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/Utils/Utils.h"
@@ -184,20 +185,41 @@ static Value computeQKTranspose(Value query, Value key, Value transposedOutput,
                                 RankedTensorType tensorType, Location loc,
                                 OpBuilder &builder,
                                 SmallVectorImpl<Operation *> &ops) {
-  SmallVector<int64_t> perm{1, 0};
-  auto transposeOp =
-      builder.create<linalg::TransposeOp>(loc, key, transposedOutput, perm);
-  ops.push_back(transposeOp);
+  //SmallVector<int64_t> perm{1, 0};
+  //auto transposeOp =
+  //    builder.create<linalg::TransposeOp>(loc, key, transposedOutput, perm);
+  //ops.push_back(transposeOp);
   Value acc =
       builder.create<linalg::FillOp>(loc, ValueRange{zero}, output).result();
-  auto matmulOp = builder.create<linalg::MatmulOp>(
-      loc, tensorType, ValueRange{query, transposeOp.getResult()[0]}, acc);
+  auto matmulOp = builder.create<linalg::MatmulTransposeBOp>(
+      loc, tensorType, ValueRange{query, key}, acc);
   ops.push_back(matmulOp);
   return matmulOp.getResult(0);
 }
 
-static std::tuple<Value, Value, Value, Value>
-extractSlices(Value key, Value value, Value query, Value output,
+Value
+extractQuerySlice(Value query,
+              ArrayRef<int64_t> queryShape, ArrayRef<Value> ivs,
+              Value sequenceTileLength, Type elementType, Location loc,
+              OpBuilder &builder) {
+  auto one = builder.getIndexAttr(1);
+  auto zero = builder.getIndexAttr(0);
+  auto headDimension = builder.getIndexAttr(queryShape.back());
+  SmallVector<OpFoldResult> strides(queryShape.size(), one);
+  SmallVector<OpFoldResult> sizes(queryShape.size(), one);
+  SmallVector<OpFoldResult> offsets(queryShape.size(), zero);
+  sizes[1] = sequenceTileLength;
+  sizes[2] = headDimension;
+  offsets[0] = ivs[0];
+  SmallVector<int64_t> tensorShape{ShapedType::kDynamic, queryShape.back()};
+  auto tensorType = RankedTensorType::get(tensorShape, elementType);
+  Value querySlice = builder.create<tensor::ExtractSliceOp>(
+      loc, tensorType, query, offsets, sizes, strides);
+  return querySlice;
+}
+
+static std::tuple<Value, Value, Value>
+extractSlices(Value key, Value value, Value output,
               ArrayRef<int64_t> queryShape, ArrayRef<Value> ivs,
               Value sequenceTileLength, Type elementType, Location loc,
               OpBuilder &builder) {
@@ -220,12 +242,10 @@ extractSlices(Value key, Value value, Value query, Value output,
 
   offsets = SmallVector<OpFoldResult>(queryShape.size(), zero);
   offsets[0] = ivs[0];
-  Value querySlice = builder.create<tensor::ExtractSliceOp>(
-      loc, tensorType, query, offsets, sizes, strides);
   Value outputSlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, output, offsets, sizes, strides);
 
-  return std::make_tuple(keySlice, valueSlice, querySlice, outputSlice);
+  return std::make_tuple(keySlice, valueSlice, outputSlice);
 }
 
 static std::tuple<Value, Value, Value>
@@ -325,6 +345,18 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   Value zeroSum =
       rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, sum).result();
 
+  Value querySlice =
+      extractQuerySlice(query, queryShape, ivs,
+                    sequenceTileLength, elementType, loc, rewriter);
+
+  //bufferization::BufferizationOptions options;
+  //FailureOr<Value> ret = bufferization::allocateTensorForShapedValue(
+  //              rewriter, loc, querySlice, false, options, true);
+  //if (failed(ret)) {
+  //  return {};
+  //}
+  //querySlice = ret.value();
+
   // Construct second loop
   scf::LoopNest secondLoopNest = createLoopNest(
       ivs, zeroValue, sequenceTileLength, sequenceLength,
@@ -338,9 +370,24 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   OpBuilder::InsertionGuard guardSecondLoop(rewriter);
   rewriter.setInsertionPointToStart(secondLoopNest.loops.back().getBody());
 
-  auto [keySlice, valueSlice, querySlice, outputSlice] =
-      extractSlices(key, value, query, iterArgResult, queryShape, ivs,
+  auto [keySlice, valueSlice, outputSlice] =
+      extractSlices(key, value, iterArgResult, queryShape, ivs,
                     sequenceTileLength, elementType, loc, rewriter);
+
+  // Promote both key and value slices for async copies
+  //ret = bufferization::allocateTensorForShapedValue(
+  //              rewriter, loc, keySlice, false, options, true);
+  //if (failed(ret)) {
+  //  return {};
+  //}
+  //keySlice = ret.value();
+
+  //ret = bufferization::allocateTensorForShapedValue(
+  //              rewriter, loc, valueSlice, false, options, true);
+  //if (failed(ret)) {
+  //  return {};
+  //}
+  //valueSlice = ret.value();
 
   // Compute matmul(q, transpose(k))
   auto headDimension = rewriter.getIndexAttr(queryShape.back());
