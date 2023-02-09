@@ -89,7 +89,7 @@ LogicalResult hoistOutputs(func::FuncOp funcOp) {
               inputOperands.push_back(input);
             }
             auto subviewOp = inputOperands[0].getDefiningOp<memref::SubViewOp>();
-            if (!subviewOp) continue;
+            if (!subviewOp) return WalkResult::advance();
             output = subviewOp.getSource();
           }
 
@@ -144,11 +144,11 @@ LogicalResult hoistOutputs(func::FuncOp funcOp) {
         // We need to get the gpu.thread_id from the affine map
         auto affineApplyOp = currentIndices[1].getDefiningOp<AffineApplyOp>();
         if (!affineApplyOp)
-          continue;
+          return WalkResult::advance();
         auto affineOperands = affineApplyOp.getMapOperands();
         assert(affineOperands.size() == 2);
         SmallVector<Value> indices{affineOperands[1], currentIndices[2]};
-        ArrayRef<bool> inBounds{true};
+        SmallVector<bool> inBounds{true};
         auto newReadOp = rewriter.create<vector::TransferReadOp>(transferReadOp.getLoc(),
             transferReadOp.getVector().getType(),
             hoistedOutput, indices,

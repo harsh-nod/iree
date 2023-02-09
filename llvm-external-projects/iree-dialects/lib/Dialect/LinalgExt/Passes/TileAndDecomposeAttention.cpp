@@ -189,8 +189,9 @@ static Value computeQKTranspose(Value query, Value key, Value transposedOutput,
   //auto transposeOp =
   //    builder.create<linalg::TransposeOp>(loc, key, transposedOutput, perm);
   //ops.push_back(transposeOp);
-  Value acc =
-      builder.create<linalg::FillOp>(loc, ValueRange{zero}, output).result();
+  auto fillOp = builder.create<linalg::FillOp>(loc, ValueRange{zero}, output);
+  ops.push_back(fillOp);
+  Value acc = fillOp.result();
   auto matmulOp = builder.create<linalg::MatmulTransposeBOp>(
       loc, tensorType, ValueRange{query, key}, acc);
   ops.push_back(matmulOp);

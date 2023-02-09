@@ -633,6 +633,8 @@ transform_dialect::VectorToMMAConversionOp::applyToOne(
   vector::populateVectorUnrollPatterns(
       unrollPatterns,
       vector::UnrollVectorOptions().setNativeShapeFn(getWmmaNativeVectorSize));
+  vector::ExtractStridedSliceOp::getCanonicalizationPatterns(unrollPatterns, ctx);
+  vector::InsertStridedSliceOp::getCanonicalizationPatterns(unrollPatterns, ctx);
   if (failed(applyPatternsAndFoldGreedily(target, std::move(unrollPatterns)))) {
     target->emitOpError(
         "failed to break up vector operations into mma native size");

@@ -11,9 +11,9 @@ transform.structured.canonicalized_sequence failures(propagate) {
 
     // Tile and decompose attention
     %attention2 = transform.structured.match ops{["iree_linalg_ext.attention"]} in %variant_op
-    %outer_loop, %inner_loop, %first_matmul, %reduce_max, %partial_softmax, %reduce_sum, %update,
+    %outer_loop, %inner_loop, %fill_op, %first_matmul, %reduce_max, %partial_softmax, %reduce_sum, %update,
         %scale_acc, %second_matmul = transform.iree.tile_and_decompose_attention %attention2 :
-        (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation)
+        (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation)
 
     %foreach_thread, %tiled_op = transform.structured.tile_to_foreach_thread_op %update num_threads [32] (mapping = [#gpu.thread<x>])
     transform.structured.fuse_into_containing_op %reduce_sum into %foreach_thread
@@ -24,6 +24,7 @@ transform.structured.canonicalized_sequence failures(propagate) {
 
     // Tile first matmul
     %foreach_thread_3, %tiled_matmul = transform.structured.tile_to_foreach_thread_op %first_matmul num_threads [1] ( mapping = [#gpu.block<x>] )
+    transform.structured.fuse_into_containing_op %fill_op into %foreach_thread_3
 
     // Tile second matmul
     %foreach_thread_4, %tiled_matmul_2 = transform.structured.tile_to_foreach_thread_op %second_matmul num_threads [1] ( mapping = [#gpu.block<x>] )
