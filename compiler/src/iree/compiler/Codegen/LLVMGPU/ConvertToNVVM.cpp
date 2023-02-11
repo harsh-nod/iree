@@ -122,6 +122,7 @@ struct ConvertToNVVMPass : public ConvertToNVVMBase<ConvertToNVVMPass> {
       populateGpuWMMAToNVVMConversionPatterns(converter, llvmPatterns);
       LLVMConversionTarget target(getContext());
       populateFuncToLLVMFuncOpConversionPattern(converter, llvmPatterns);
+      populateGPUPrintLLVMConversionPatterns(llvmPatterns, converter);
       configureGpuToNVVMConversionLegality(target);
       target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp funcOp) {
         if (isEntryPoint(funcOp)) return false;

@@ -159,9 +159,6 @@ LogicalResult hoistOutputs(func::FuncOp funcOp) {
       }
     }
 
-
-    funcOp->getParentOfType<ModuleOp>().dump();
-
     return WalkResult::advance();
   });
   return success();

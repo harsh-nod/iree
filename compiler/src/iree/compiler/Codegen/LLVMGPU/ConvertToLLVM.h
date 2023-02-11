@@ -26,6 +26,8 @@ void populateConvertSharedMemoryAllocOps(RewritePatternSet &patterns);
 
 void ConvertToDynamicSharedMemory(ModuleOp moduleOp);
 
+void populateGPUPrintLLVMConversionPatterns(RewritePatternSet &patterns, LLVMTypeConverter &converter);
+
 }  // namespace iree_compiler
 }  // namespace mlir
 

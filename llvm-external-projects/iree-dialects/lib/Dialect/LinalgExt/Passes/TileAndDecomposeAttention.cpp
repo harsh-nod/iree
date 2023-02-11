@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/Utils/Utils.h"
@@ -74,7 +75,7 @@ computeNewSum(Value oldMax, Value newMax, Value oldSum, Value currentSum,
 }
 
 static Value computePartialSoftmax(Value qkTranspose, Value currentMax,
-                                   Value output, Location loc,
+                                   Location loc,
                                    OpBuilder &builder,
                                    SmallVectorImpl<Operation *> &ops) {
   AffineMap identityMap =
@@ -83,14 +84,14 @@ static Value computePartialSoftmax(Value qkTranspose, Value currentMax,
   bindDims(builder.getContext(), d0, d1);
   // (d0, d1) -> (d0)
   auto rowMap = AffineMap::get(2, 0, {d0}, builder.getContext());
-  SmallVector<AffineMap> indexingMaps{identityMap, rowMap, identityMap};
+  SmallVector<AffineMap> indexingMaps{rowMap, identityMap};
   SmallVector<utils::IteratorType> iteratorTypes(2,
                                                  utils::IteratorType::parallel);
   auto genericOp = builder.create<linalg::GenericOp>(
-      loc, qkTranspose.getType(), ValueRange{qkTranspose, currentMax}, output,
+      loc, qkTranspose.getType(), ValueRange{currentMax}, qkTranspose,
       indexingMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
-        Value diff = b.create<arith::SubFOp>(loc, args[0], args[1]);
+        Value diff = b.create<arith::SubFOp>(loc, args[1], args[0]);
         Value result = b.create<math::ExpOp>(loc, diff);
         b.create<linalg::YieldOp>(loc, result);
       });
@@ -98,42 +99,31 @@ static Value computePartialSoftmax(Value qkTranspose, Value currentMax,
   return genericOp.getResult(0);
 }
 
-static std::tuple<Value, Value, Value, Value>
-updateAndScale(Value oldMax, Value newMax, Value oldSum, Value currentSum,
-               Value partialSoftmax, Value output, Value softmaxOutput,
+static Value
+updateAndScale(Value oldMax, Value newMax, Value oldSum,
                Location loc, OpBuilder &builder,
                SmallVectorImpl<Operation *> &ops) {
-  SmallVector<utils::IteratorType> iteratorTypes(2,
+  SmallVector<utils::IteratorType> iteratorTypes(1,
                                                  utils::IteratorType::parallel);
-  auto identityMap = AffineMap::getMultiDimIdentityMap(2, builder.getContext());
-  AffineExpr d0, d1;
-  bindDims(builder.getContext(), d0, d1);
-  auto rowMap = AffineMap::get(2, 0, {d0}, builder.getContext());
-  SmallVector<AffineMap> indexingMaps{rowMap, rowMap,      rowMap,
-                                      rowMap, identityMap, rowMap,
-                                      rowMap, identityMap, rowMap};
-  SmallVector<Type> resultTypes{currentSum.getType(), currentSum.getType(),
-                                softmaxOutput.getType(), newMax.getType()};
+  auto identityMap = AffineMap::getMultiDimIdentityMap(1, builder.getContext());
+  SmallVector<AffineMap> indexingMaps(3, identityMap);
+  SmallVector<Type> resultTypes{oldSum.getType()};
   auto genericOp = builder.create<linalg::GenericOp>(
       loc, resultTypes,
-      ValueRange{oldMax, newMax, oldSum, currentSum, partialSoftmax},
-      ValueRange{output, output, softmaxOutput, output}, indexingMaps,
+      ValueRange{oldMax, newMax},
+      ValueRange{oldSum}, indexingMaps,
       iteratorTypes, [&](OpBuilder &b, Location loc, ValueRange args) {
         Value diff = b.create<arith::SubFOp>(loc, args[0], args[1]);
         Value weight = b.create<math::ExpOp>(loc, diff);
         Value scaledOldSum = b.create<arith::MulFOp>(loc, weight, args[2]);
-        Value newSum = b.create<arith::AddFOp>(loc, scaledOldSum, args[3]);
-        Value result = b.create<arith::DivFOp>(loc, args[4], newSum);
-        b.create<linalg::YieldOp>(
-            loc, ValueRange{newSum, scaledOldSum, result, args[1]});
+        b.create<linalg::YieldOp>(loc, ValueRange{scaledOldSum});
       });
   ops.push_back(genericOp);
-  return std::make_tuple(genericOp.getResult(0), genericOp.getResult(1),
-                         genericOp.getResult(2), genericOp.getResult(3));
+  return genericOp.getResult(0);
 }
 
-static Value scalePartialSoftmax(Value softmax, Value scaledOldSum,
-                                 Value output, Location loc, OpBuilder &builder,
+static Value scalePartialSoftmax(Value softmax, Value newSum,
+                                 Location loc, OpBuilder &builder,
                                  SmallVectorImpl<Operation *> &ops) {
   AffineMap identityMap =
       AffineMap::getMultiDimIdentityMap(2, builder.getContext());
@@ -141,22 +131,22 @@ static Value scalePartialSoftmax(Value softmax, Value scaledOldSum,
   bindDims(builder.getContext(), d0, d1);
   // (d0, d1) -> (d0)
   auto rowMap = AffineMap::get(2, 0, {d0}, builder.getContext());
-  SmallVector<AffineMap> indexingMaps{identityMap, rowMap, identityMap};
+  SmallVector<AffineMap> indexingMaps{rowMap, identityMap};
   SmallVector<utils::IteratorType> iteratorTypes(2,
                                                  utils::IteratorType::parallel);
   auto genericOp = builder.create<linalg::GenericOp>(
-      loc, softmax.getType(), ValueRange{softmax, scaledOldSum}, output,
+      loc, softmax.getType(), ValueRange{newSum}, softmax,
       indexingMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
-        Value result = b.create<arith::DivFOp>(loc, args[0], args[1]);
+        Value result = b.create<arith::DivFOp>(loc, args[1], args[0]);
         b.create<linalg::YieldOp>(loc, result);
       });
   ops.push_back(genericOp);
   return genericOp.getResult(0);
 }
 
-static Value scaleAccumulator(Value accumulator, Value scaledOldSum,
-                              Value newSum, Value output, Location loc,
+static Value scaleAccumulator(Value accumulator, Value scaledOldSum, Value newSum,
+                              Value output, Location loc,
                               OpBuilder &builder,
                               SmallVectorImpl<Operation *> &ops) {
   AffineMap identityMap =
@@ -172,17 +162,17 @@ static Value scaleAccumulator(Value accumulator, Value scaledOldSum,
       loc, accumulator.getType(), ValueRange{accumulator, scaledOldSum, newSum},
       output, indexingMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
-        Value prod = b.create<arith::DivFOp>(loc, args[1], args[2]);
-        Value result = b.create<arith::MulFOp>(loc, prod, args[0]);
+        Value ratio = b.create<arith::DivFOp>(loc, args[1], args[2]);
+        Value result = b.create<arith::MulFOp>(loc, ratio, args[0]);
         b.create<linalg::YieldOp>(loc, result);
       });
   ops.push_back(genericOp);
   return genericOp.getResult(0);
 }
 
-static Value computeQKTranspose(Value query, Value key, Value transposedOutput,
+static Value computeQKTranspose(Value query, Value key,
                                 Value output, Value zero,
-                                RankedTensorType tensorType, Location loc,
+                                Location loc,
                                 OpBuilder &builder,
                                 SmallVectorImpl<Operation *> &ops) {
   //SmallVector<int64_t> perm{1, 0};
@@ -193,7 +183,7 @@ static Value computeQKTranspose(Value query, Value key, Value transposedOutput,
   ops.push_back(fillOp);
   Value acc = fillOp.result();
   auto matmulOp = builder.create<linalg::MatmulTransposeBOp>(
-      loc, tensorType, ValueRange{query, key}, acc);
+      loc, output.getType(), ValueRange{query, key}, acc);
   ops.push_back(matmulOp);
   return matmulOp.getResult(0);
 }
@@ -201,7 +191,7 @@ static Value computeQKTranspose(Value query, Value key, Value transposedOutput,
 Value
 extractQuerySlice(Value query,
               ArrayRef<int64_t> queryShape, ArrayRef<Value> ivs,
-              Value sequenceTileLength, Type elementType, Location loc,
+              OpFoldResult sequenceTileLength, Type elementType, Location loc,
               OpBuilder &builder) {
   auto one = builder.getIndexAttr(1);
   auto zero = builder.getIndexAttr(0);
@@ -212,7 +202,7 @@ extractQuerySlice(Value query,
   sizes[1] = sequenceTileLength;
   sizes[2] = headDimension;
   offsets[0] = ivs[0];
-  SmallVector<int64_t> tensorShape{ShapedType::kDynamic, queryShape.back()};
+  SmallVector<int64_t> tensorShape{queryShape[1], queryShape[2]};
   auto tensorType = RankedTensorType::get(tensorShape, elementType);
   Value querySlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, query, offsets, sizes, strides);
@@ -222,7 +212,7 @@ extractQuerySlice(Value query,
 static std::tuple<Value, Value, Value>
 extractSlices(Value key, Value value, Value output,
               ArrayRef<int64_t> queryShape, ArrayRef<Value> ivs,
-              Value sequenceTileLength, Type elementType, Location loc,
+              OpFoldResult sequenceTileLength, Type elementType, Location loc,
               OpBuilder &builder) {
   auto one = builder.getIndexAttr(1);
   auto zero = builder.getIndexAttr(0);
@@ -234,7 +224,7 @@ extractSlices(Value key, Value value, Value output,
   sizes[2] = headDimension;
   offsets[0] = ivs[0];
   offsets[1] = ivs[1];
-  SmallVector<int64_t> tensorShape{ShapedType::kDynamic, queryShape.back()};
+  SmallVector<int64_t> tensorShape{queryShape[1], queryShape[2]};
   auto tensorType = RankedTensorType::get(tensorShape, elementType);
   Value keySlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, key, offsets, sizes, strides);
@@ -249,10 +239,29 @@ extractSlices(Value key, Value value, Value output,
   return std::make_tuple(keySlice, valueSlice, outputSlice);
 }
 
+static std::tuple<Value, Value>
+extractStatSlices(Value max, Value sum,
+              ArrayRef<int64_t> queryShape,
+              OpFoldResult sequenceTileLength, Type elementType, Location loc,
+              OpBuilder &builder) {
+  auto one = builder.getIndexAttr(1);
+  auto zero = builder.getIndexAttr(0);
+  SmallVector<OpFoldResult> strides(2, one);
+  SmallVector<OpFoldResult> sizes{one, sequenceTileLength};
+  SmallVector<OpFoldResult> offsets(2, zero);
+  SmallVector<int64_t> tensorShape{queryShape[1]};
+  auto tensorType = RankedTensorType::get(tensorShape, elementType);
+  Value maxSlice = builder.create<tensor::ExtractSliceOp>(
+      loc, tensorType, max, offsets, sizes, strides);
+  Value sumSlice = builder.create<tensor::ExtractSliceOp>(
+      loc, tensorType, sum, offsets, sizes, strides);
+  return std::make_tuple(maxSlice, sumSlice);
+}
+
 static std::tuple<Value, Value, Value>
 insertSlices(Value newResult, Value result, Value newMax, Value max,
              Value newSum, Value sum, ArrayRef<int64_t> queryShape,
-             ArrayRef<Value> ivs, Value sequenceTileLength, Location loc,
+             ArrayRef<Value> ivs, OpFoldResult sequenceTileLength, Location loc,
              OpBuilder &builder) {
   auto one = builder.getIndexAttr(1);
   auto zero = builder.getIndexAttr(0);
@@ -265,9 +274,9 @@ insertSlices(Value newResult, Value result, Value newMax, Value max,
   offsets[0] = ivs[0];
   Value updatedAcc = builder.create<tensor::InsertSliceOp>(
       loc, newResult, result, offsets, sizes, strides);
-  offsets = SmallVector<OpFoldResult>{zero};
-  sizes = SmallVector<OpFoldResult>{sequenceTileLength};
-  strides = SmallVector<OpFoldResult>{one};
+  offsets = SmallVector<OpFoldResult>(2, zero);
+  sizes = SmallVector<OpFoldResult>{one, sequenceTileLength};
+  strides = SmallVector<OpFoldResult>(2, one);
   Value updatedMax = builder.create<tensor::InsertSliceOp>(
       loc, newMax, max, offsets, sizes, strides);
   Value updatedSum = builder.create<tensor::InsertSliceOp>(
@@ -306,17 +315,15 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   ArrayRef<int64_t> queryShape = queryType.getShape();
   SmallVector<OpFoldResult> queryDimValues =
       tensor::createDimValues(rewriter, loc, query);
-  Value sequenceTileLength =
-      getValueOrCreateConstantIndexOp(rewriter, loc, queryDimValues[1]);
-  Value batchTileLength =
-      getValueOrCreateConstantIndexOp(rewriter, loc, queryDimValues[0]);
+  OpFoldResult headDimension = queryDimValues[2];
+  OpFoldResult sequenceTileLength = queryDimValues[1];
+  OpFoldResult batchTileLength = queryDimValues[0];
 
   Value key = attnOp.getKey();
   Value value = attnOp.getValue();
   SmallVector<OpFoldResult> keyDimValues =
       tensor::createDimValues(rewriter, loc, key);
-  Value sequenceLength =
-      getValueOrCreateConstantIndexOp(rewriter, loc, keyDimValues[1]);
+  OpFoldResult sequenceLength = keyDimValues[1];
 
   // Construct first loop
   Value zeroValue = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -324,7 +331,7 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   SmallVector<Value> ivs;
   Value output = attnOp.getOutput();
   scf::LoopNest firstLoopNest =
-      createLoopNest(ivs, zeroValue, oneValue, batchTileLength,
+      createLoopNest(ivs, zeroValue, oneValue, getValueOrCreateConstantIndexOp(rewriter, loc, batchTileLength),
                      ValueRange({output}), loc, rewriter);
   Value iterArg = firstLoopNest.loops.back().getRegionIterArg(0);
   ops.push_back(firstLoopNest.loops.back());
@@ -333,15 +340,22 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   rewriter.setInsertionPointToStart(firstLoopNest.loops.back().getBody());
 
   // Create max and sum statistics
-  SmallVector<OpFoldResult> dims{sequenceTileLength};
+  //SmallVector<OpFoldResult> dims{sequenceTileLength};
   Value zeroF32 = rewriter.create<arith::ConstantOp>(
       loc, rewriter.getZeroAttr(elementType));
   Value largeNegativeF32 = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getFloatAttr(elementType, -1e30));
+      loc, rewriter.getFloatAttr(elementType, -32767));
+  auto maxType = RankedTensorType::get(SmallVector<int64_t>{1, queryShape[1]}, elementType);
+  SmallVector<Value> dynamicIndices;
+  if (ShapedType::isDynamic(queryShape[1]))
+    dynamicIndices.push_back(getValueOrCreateConstantIndexOp(rewriter, loc, sequenceTileLength));
+  SmallVector<OpFoldResult> dims{rewriter.getIndexAttr(1), sequenceTileLength};
+  //Value max = rewriter.create<bufferization::AllocTensorOp>(loc, maxType, dynamicIndices);
   Value max = rewriter.create<tensor::EmptyOp>(loc, dims, elementType);
   Value negativeMax =
       rewriter.create<linalg::FillOp>(loc, ValueRange{largeNegativeF32}, max)
           .result();
+  //Value sum = rewriter.create<bufferization::AllocTensorOp>(loc, maxType, dynamicIndices);
   Value sum = rewriter.create<tensor::EmptyOp>(loc, dims, elementType);
   Value zeroSum =
       rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, sum).result();
@@ -360,7 +374,8 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
 
   // Construct second loop
   scf::LoopNest secondLoopNest = createLoopNest(
-      ivs, zeroValue, sequenceTileLength, sequenceLength,
+      ivs, zeroValue, getValueOrCreateConstantIndexOp(rewriter, loc, sequenceTileLength),
+      getValueOrCreateConstantIndexOp(rewriter, loc, sequenceLength),
       ValueRange({iterArg, negativeMax, zeroSum}), loc, rewriter);
   ops.push_back(secondLoopNest.loops.back());
 
@@ -374,6 +389,9 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   auto [keySlice, valueSlice, outputSlice] =
       extractSlices(key, value, iterArgResult, queryShape, ivs,
                     sequenceTileLength, elementType, loc, rewriter);
+
+  auto [maxSlice, sumSlice] =
+      extractStatSlices(iterArgMax, iterArgSum, queryShape, sequenceTileLength, elementType, loc, rewriter);
 
   // Promote both key and value slices for async copies
   //ret = bufferization::allocateTensorForShapedValue(
@@ -391,40 +409,37 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   //valueSlice = ret.value();
 
   // Compute matmul(q, transpose(k))
-  auto headDimension = rewriter.getIndexAttr(queryShape.back());
-  SmallVector<OpFoldResult> transposedShape{headDimension, sequenceTileLength};
-  Value empty =
-      rewriter.create<tensor::EmptyOp>(loc, transposedShape, elementType);
   SmallVector<OpFoldResult> resultShape{sequenceTileLength, sequenceTileLength};
   Value emptySquare =
       rewriter.create<tensor::EmptyOp>(loc, resultShape, elementType);
-  auto tensorType = RankedTensorType::get(
-      SmallVector<int64_t>(2, ShapedType::kDynamic), elementType);
   Value qkTranspose =
-      computeQKTranspose(querySlice, keySlice, empty, emptySquare, zeroF32,
-                         tensorType, loc, rewriter, ops);
+      computeQKTranspose(querySlice, keySlice, emptySquare, zeroF32,
+                         loc, rewriter, ops);
 
-  empty = rewriter.create<tensor::EmptyOp>(
+  Value empty = rewriter.create<tensor::EmptyOp>(
       loc, SmallVector<OpFoldResult>{sequenceTileLength}, elementType);
 
   // Compute current statistics
-  Value currentMax = computeRowwiseReduction<arith::MaxFOp>(
-      qkTranspose, iterArgMax, loc, rewriter, ops);
-  Value partialSoftmax = computePartialSoftmax(qkTranspose, currentMax,
-                                               emptySquare, loc, rewriter, ops);
-  Value currentSum = computeRowwiseReduction<arith::AddFOp>(
-      partialSoftmax, zeroSum, loc, rewriter, ops);
+  Value newMax = computeRowwiseReduction<arith::MaxFOp>(
+      qkTranspose, maxSlice, loc, rewriter, ops);
 
-  auto [newSum, scaledOldSum, softmax, newMax] =
-      updateAndScale(iterArgMax, currentMax, iterArgSum, currentSum,
-                     partialSoftmax, empty, emptySquare, loc, rewriter, ops);
+  Value partialSoftmax = computePartialSoftmax(qkTranspose, newMax,
+                                               loc, rewriter, ops);
+
+  Value scaledOldSum =
+      updateAndScale(maxSlice, newMax, sumSlice,
+                     loc, rewriter, ops);
+
+  Value newSum = computeRowwiseReduction<arith::AddFOp>(
+      partialSoftmax, scaledOldSum, loc, rewriter, ops);
+
+  Value softmax = scalePartialSoftmax(partialSoftmax, newSum, loc, rewriter, ops);
 
   // Update accumulator
   empty = rewriter.create<tensor::EmptyOp>(
-      loc, SmallVector<OpFoldResult>{sequenceLength, headDimension},
+      loc, SmallVector<OpFoldResult>{sequenceTileLength, headDimension},
       elementType);
-  Value scaledAcc = scaleAccumulator(outputSlice, scaledOldSum, newSum, empty,
-                                     loc, rewriter, ops);
+  Value scaledAcc = scaleAccumulator(outputSlice, scaledOldSum, newSum, empty, loc, rewriter, ops);
 
   // Compute matmul(softmax, v)
   auto matmulOp = rewriter.create<linalg::MatmulOp>(
@@ -500,7 +515,7 @@ struct TileAndDecomposeAttentionPass
     : public TileAndDecomposeAttentionBase<TileAndDecomposeAttentionPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<AffineDialect, IREE::LinalgExt::IREELinalgExtDialect,
-                    linalg::LinalgDialect, scf::SCFDialect,
+                    linalg::LinalgDialect, scf::SCFDialect, gpu::GPUDialect,
                     tensor::TensorDialect>();
   }
 

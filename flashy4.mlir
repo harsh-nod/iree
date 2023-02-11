@@ -2,23 +2,31 @@ transform.structured.canonicalized_sequence failures(propagate) {
   ^bb0(%variant_op: !pdl.operation):
 
     // Get attention op
+    // ==========================================
     %attention = transform.structured.match ops{["iree_linalg_ext.attention"]} in %variant_op
 
     // Tile and distribute to workgroups
-     %foreach_thread_grid, %tiled_attention =
+    // ==========================================
+    %foreach_thread_grid, %tiled_attention =
     transform.iree.tile_to_foreach_thread_and_workgroup_count_region %attention tile_sizes [1, 32]
       ( mapping = [#gpu.block<x>, #gpu.block<y>] )
 
     // Tile and decompose attention
+    // ==========================================
     %attention2 = transform.structured.match ops{["iree_linalg_ext.attention"]} in %variant_op
     %outer_loop, %inner_loop, %fill_op, %first_matmul, %reduce_max, %partial_softmax, %reduce_sum, %update,
-        %scale_acc, %second_matmul = transform.iree.tile_and_decompose_attention %attention2 :
-        (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation)
+    %softmax, %scale_acc, %second_matmul = transform.iree.tile_and_decompose_attention %attention2 :
+       (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation)
 
-    %foreach_thread, %tiled_op = transform.structured.tile_to_foreach_thread_op %update num_threads [32] (mapping = [#gpu.thread<x>])
-    transform.structured.fuse_into_containing_op %reduce_sum into %foreach_thread
-    transform.structured.fuse_into_containing_op %partial_softmax into %foreach_thread
-    transform.structured.fuse_into_containing_op %reduce_max into %foreach_thread
+    %foreach_thread_a, %tiled_op_a = transform.structured.tile_to_foreach_thread_op %update num_threads [32] (mapping = [#gpu.thread<x>])
+    %foreach_thread_b, %tiled_op_b = transform.structured.tile_to_foreach_thread_op %reduce_sum num_threads [32] (mapping = [#gpu.thread<x>])
+    %foreach_thread_c, %tiled_op_c = transform.structured.tile_to_foreach_thread_op %partial_softmax num_threads [32] (mapping = [#gpu.thread<x>])
+    %foreach_thread_d, %tiled_op_d = transform.structured.tile_to_foreach_thread_op %softmax num_threads [32] (mapping = [#gpu.thread<x>])
+    %foreach_thread_e, %tiled_op_e = transform.structured.tile_to_foreach_thread_op %reduce_max num_threads [32] (mapping = [#gpu.thread<x>])
+
+    //transform.structured.fuse_into_containing_op %reduce_sum into %foreach_thread
+    //transform.structured.fuse_into_containing_op %partial_softmax into %foreach_thread
+    //transform.structured.fuse_into_containing_op %reduce_max into %foreach_thread
 
     %foreach_thread_2, %tiled_op_2 = transform.structured.tile_to_foreach_thread_op %scale_acc num_threads [32] (mapping = [#gpu.thread<x>])
 
