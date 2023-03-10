@@ -488,6 +488,12 @@ def LLVMGPUDistribute :
   let constructor = "mlir::iree_compiler::createLLVMGPUDistribute()";
 }
 
+def LayoutAnalysisAndDistribution :
+    Pass<"layout-analysis-and-distribution", "func::FuncOp"> {
+  let summary = "Pass to do layout analysis followed by distribution";
+  let constructor = "mlir::iree_compiler::createLayoutAnalysisAndDistributionPass()";
+}
+
 def LLVMGPUTensorAlloc :
     Pass<"iree-llvmgpu-alloc", "func::FuncOp"> {
   let summary = "Pass to create allocation for some values.";
