@@ -531,7 +531,7 @@ void convertToSIMT(Operation *op, DenseMap<Value, Layout> &layoutMap, DenseMap<V
     int K = lhsLayout.shape[Dims::BATCH1];
     ArrayRef<int64_t> lhsShape = lhs.getType().cast<ShapedType>().getShape();
     ArrayRef<int64_t> rhsShape = rhs.getType().cast<ShapedType>().getShape();
-    bool transpose = lhsShape[0] != rhsShape[1];
+    bool transpose = lhsShape[1] != rhsShape[0];
     auto cType = VectorType::get({vecShape[2], vecShape[3]}, elementType);
     for (int i = 0; i < M; i++) {
       for (int j = 0; j < N; j++) {
