@@ -308,8 +308,8 @@ def VectorWarpDistributionOp : Op<Transform_Dialect, "iree.vector.warp_distribut
   let results = (outs);
 
   let assemblyFormat = [{
-    $target 
-    attr-dict 
+    $target
+    attr-dict
     `:` functional-type($target, results)
   }];
   let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
@@ -426,9 +426,9 @@ def PipelineSharedMemoryCopiesOp : Op<
 
   let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
 
-  let assemblyFormat = [{ 
-    $for_op 
-    attr-dict 
+  let assemblyFormat = [{
+    $for_op
+    attr-dict
     `:` functional-type(operands, results)}];
 
   let extraClassDeclaration = [{
@@ -461,9 +461,9 @@ def CreateAsyncGroupsOp :
                    BoolAttr:$use_mma_sync);
   let results = (outs);
 
-  let assemblyFormat = [{ 
-    $target 
-    attr-dict 
+  let assemblyFormat = [{
+    $target
+    attr-dict
     `:` functional-type(operands, results)}];
   let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
 

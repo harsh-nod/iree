@@ -8,7 +8,7 @@ transform.sequence failures(propagate) {
     // Tile and distribute to workgroups
     // ==========================================
     %forall_grid, %tiled_attention =
-    transform.structured.tile_to_forall_op %attention tile_sizes [1, 128]
+    transform.structured.tile_to_forall_op %attention tile_sizes [1, 64]
       ( mapping = [#gpu.block<x>, #gpu.block<y>] )
 
     // Tile and decompose attention
@@ -33,6 +33,11 @@ transform.sequence failures(propagate) {
     %variant_op_3 = transform.iree.bufferize { target_gpu } %variant_op : (!pdl.operation) -> (!pdl.operation)
     %memref_func = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
     transform.iree.erase_hal_descriptor_type_from_memref %memref_func : (!pdl.operation) -> ()
+
+    // Step 5. Pre-process the contract and transfer ops to put it in the right form.
+    // ===========================================================================
+    %func_2 = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
+    transform.iree.apply_patterns %func_2 {  prepare_vector_to_mma } : (!pdl.operation) -> ()
 
     // Step 6. Post-bufferization vector distribution
     // ===========================================================================
