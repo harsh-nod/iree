@@ -308,8 +308,8 @@ def VectorWarpDistributionOp : Op<Transform_Dialect, "iree.vector.warp_distribut
   let results = (outs);
 
   let assemblyFormat = [{
-    $target 
-    attr-dict 
+    $target
+    attr-dict
     `:` functional-type($target, results)
   }];
   let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
@@ -426,9 +426,9 @@ def PipelineSharedMemoryCopiesOp : Op<
 
   let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
 
-  let assemblyFormat = [{ 
-    $for_op 
-    attr-dict 
+  let assemblyFormat = [{
+    $for_op
+    attr-dict
     `:` functional-type(operands, results)}];
 
   let extraClassDeclaration = [{
@@ -461,9 +461,9 @@ def CreateAsyncGroupsOp :
                    BoolAttr:$use_mma_sync);
   let results = (outs);
 
-  let assemblyFormat = [{ 
-    $target 
-    attr-dict 
+  let assemblyFormat = [{
+    $target
+    attr-dict
     `:` functional-type(operands, results)}];
   let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
 
@@ -492,6 +492,45 @@ def LayoutAnalysisAndDistributionOp :
 
     The layout is represented as an 8D vector with the following shape:
     batch0, batch1, laneidz, laneidy, laneidx, vecidz, vecidy, vecidx
+
+  }];
+
+  let arguments = (ins PDL_Operation:$target);
+  let results = (outs Variadic<PDL_Operation>:$result);
+
+  let assemblyFormat = [{ $target attr-dict `:` functional-type(operands, results)}];
+  let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
+
+  let builders = [
+    OpBuilder<(ins "Value":$target)>
+  ];
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::func::FuncOp target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+
+}
+
+def ReorderTransposeOp :
+  Op<Transform_Dialect, "iree.reorder_transpose",
+    [FunctionalStyleTransformOpTrait,
+     MemoryEffectsOpInterface,
+     TransformEachOpTrait,
+     TransformOpInterface]> {
+  let description = [{
+    Targets the whole func op and does the following:
+
+    Given IR that looks like
+        %0 = arith.subf %a, %b : vector<16x8xf16>
+        %1 = vector.transpose %0 [1, 0] : vector<16x8xf16> to vector<8x16xf16>
+
+    It moves the transpose before the elementwise op to produce
+        %transposed_a = vector.transpose %a [1, 0] : vector<16x8xf16> to vector<8x16xf16>
+        %transposed_b = vector.transpose %b [1, 0] : vector<16x8xf16> to vector<8x16xf16>
+        %0 = arith.subf %transposed_a, %transposed_b : vector<8x16xf16>
 
   }];
 

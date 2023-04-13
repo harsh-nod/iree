@@ -84,6 +84,8 @@ struct Layout {
   // Shape of the tensor when used in mma
   std::array<int, maxTensorDims> canonicalShape;
   int rank;
+  // Dimension which has been reduced (for 1D vectors)
+  int reductionDim;
 };
 
 // MMA Layout Utilities
@@ -260,6 +262,8 @@ static void setMMALayout(Value aMatrix, Value bMatrix, Value cMatrix,
     layout.updateBatchDims(shape[0], shape[1]);
     if (layoutMap.count(matrix) && (layout != layoutMap.at(matrix))) {
       layoutConflicts.try_emplace(matrix, layout);
+      layout.debugPrint("!!conflict!! current ");
+      layoutMap.at(matrix).debugPrint("!!conflict!! expected ");
     } else {
       layoutMap.try_emplace(matrix, layout);
       layout.debugPrint(name);
@@ -273,7 +277,8 @@ static void setMMALayout(Value aMatrix, Value bMatrix, Value cMatrix,
 
 static void propagateLayoutToReduceBroadcastTranspose(
     vector::MultiDimReductionOp reductionOp, vector::BroadcastOp broadcastOp,
-    vector::TransposeOp transposeOp, DenseMap<Value, Layout> &layoutMap) {
+    vector::TransposeOp transposeOp, DenseMap<Value, Layout> &layoutMap,
+    DenseMap<Value, Layout> &layoutConflicts) {
   if (!broadcastOp) return;
   if (!transposeOp) return;
   Value reductionSrc = reductionOp.getSource();
@@ -314,10 +319,20 @@ static void propagateLayoutToReduceBroadcastTranspose(
   Value transposedResult = transposeOp.getResult();
   layoutMap.try_emplace(transposedResult, layoutMap.at(reductionSrc));
   layoutMap.at(transposedResult).debugPrint("transposed");
+  // The accumulator is 1D, but we will treat it as 2D and enforce
+  // the same layout as the source
+  Value acc = reductionOp.getAcc();
+  if (layoutMap.count(acc)) return;
+  Layout layout = layoutMap.at(reductionSrc);
+  layout.rank = 1;
+  layout.reductionDim = reductionDims[0].getInt();
+  layoutMap.try_emplace(acc, layout);
+  layoutMap.at(acc).debugPrint("accumulator");
 }
 
-static std::tuple<vector::BroadcastOp, vector::TransposeOp>
+static std::vector<std::tuple<vector::BroadcastOp, vector::TransposeOp>>
 checkForReduceBroadcastTranspose(vector::MultiDimReductionOp reductionOp) {
+  std::vector<std::tuple<vector::BroadcastOp, vector::TransposeOp>> pairs;
   vector::BroadcastOp broadcastOp{nullptr};
   vector::TransposeOp transposeOp{nullptr};
   for (Operation *user : reductionOp.getResult().getUsers()) {
@@ -329,10 +344,10 @@ checkForReduceBroadcastTranspose(vector::MultiDimReductionOp reductionOp) {
         }
       }
       broadcastOp = broadcast;
-      break;
+      pairs.push_back(std::make_tuple(broadcastOp, transposeOp));
     }
   }
-  return std::make_tuple(broadcastOp, transposeOp);
+  return pairs;
 }
 
 static void propagateLayoutToFor(scf::ForOp forOp,
@@ -351,45 +366,91 @@ static void propagateLayoutToFor(scf::ForOp forOp,
 }
 
 static void propagateLayoutToOthers(SmallVectorImpl<Value> &operands,
-                                    DenseMap<Value, Layout> &layoutMap) {
+                                    DenseMap<Value, Layout> &layoutMap,
+                                    DenseMap<Value, Layout> &layoutConflicts) {
   int numOperands = operands.size();
   // Find an operand with a layout
   int i;
+  bool success{false};
   for (i = 0; i < numOperands; i++) {
-    if (layoutMap.count(operands[i])) break;
+    if (layoutMap.count(operands[i])) {
+      success = true;
+      break;
+    }
   }
+  if (!success) return;
   // Propagate layout to others
   for (int j = 0; j < numOperands; j++) {
     if (j == i) continue;
     if (!layoutMap.count(operands[j])) {
       layoutMap.try_emplace(operands[j], layoutMap.at(operands[i]));
       layoutMap.at(operands[j]).debugPrint("binary/unary operand");
-    } else {
-      assert(layoutMap.at(operands[i]) == layoutMap.at(operands[j]));
+    } else if (layoutMap.at(operands[i]) != layoutMap.at(operands[j])) {
+      layoutConflicts.try_emplace(operands[j], layoutMap.at(operands[i]));
+      layoutMap.at(operands[j]).debugPrint("!!conflict!! current ");
+      layoutMap.at(operands[i]).debugPrint("!!conflict!! expected ");
     }
   }
 }
 
 static void propagateLayoutToElementwiseOp(Operation *op,
-                                           DenseMap<Value, Layout> &layoutMap) {
+                                           DenseMap<Value, Layout> &layoutMap,
+                                           DenseMap<Value, Layout> &layoutConflicts) {
   if (!OpTrait::hasElementwiseMappableTraits(op) || op->getNumResults() != 1)
     return;
   auto operands = llvm::to_vector(op->getOperands());
   operands.push_back(op->getResult(0));
-  propagateLayoutToOthers(operands, layoutMap);
+  propagateLayoutToOthers(operands, layoutMap, layoutConflicts);
 }
 
-static void propagateLayout(Operation *op, DenseMap<Value, Layout> &layoutMap) {
+// Check that the final shape matches that of the layout
+static void propagateLayoutToInnerBroadcast(vector::BroadcastOp broadcastOp,
+                                            vector::TransposeOp transposeOp,
+                                            DenseMap<Value, Layout> &layoutMap) {
+  Value src = broadcastOp.getSource();
+  if (!layoutMap.count(src)) return;
+  ArrayRef<int64_t> resultShape = transposeOp.getResult().getType().cast<ShapedType>().getShape();
+  Layout layout = layoutMap.at(src);
+  if (layout.order.size() != resultShape.size()) return;
+  for (int i = 0; i < resultShape.size(); i++) {
+    int size{1};
+    for (int dimType : layout.order[i]) {
+      size *= layout.shape[dimType];
+    }
+    if (size != resultShape[i]) return;
+  }
+  layoutMap.try_emplace(transposeOp.getResult(), layoutMap.at(src));
+}
+
+static void propagateLayout(Operation *op, DenseMap<Value, Layout> &layoutMap,
+                            DenseMap<Value, Layout> &layoutConflicts) {
   if (auto reductionOp = dyn_cast<vector::MultiDimReductionOp>(op)) {
-    auto [broadcastOp, transposeOp] =
-        checkForReduceBroadcastTranspose(reductionOp);
-    propagateLayoutToReduceBroadcastTranspose(reductionOp, broadcastOp,
-                                              transposeOp, layoutMap);
+    auto pairs = checkForReduceBroadcastTranspose(reductionOp);
+    Value result;
+    for (auto [broadcastOp, transposeOp] : pairs) {
+      if (!result) {
+        propagateLayoutToReduceBroadcastTranspose(reductionOp, broadcastOp,
+                                                  transposeOp, layoutMap, layoutConflicts);
+        result = transposeOp.getResult();
+      } else {
+        layoutMap.try_emplace(transposeOp.getResult(), layoutMap.at(result));
+        layoutMap.at(transposeOp.getResult()).debugPrint("transposed");
+      }
+    }
+    if (!result) return;
+  }
+  if (auto broadcastOp = dyn_cast<vector::BroadcastOp>(op)) {
+    if (broadcastOp.getSource().getDefiningOp<vector::MultiDimReductionOp>())
+      return;
+    for (Operation *user : broadcastOp->getResult(0).getUsers()) {
+      if (auto transposeOp = dyn_cast<vector::TransposeOp>(user))
+        propagateLayoutToInnerBroadcast(broadcastOp, transposeOp, layoutMap);
+    }
   }
   if (auto forOp = dyn_cast<scf::ForOp>(op)) {
     propagateLayoutToFor(forOp, layoutMap);
   }
-  propagateLayoutToElementwiseOp(op, layoutMap);
+  propagateLayoutToElementwiseOp(op, layoutMap, layoutConflicts);
 }
 
 /// Get indices of transfer op after distribution.
@@ -601,8 +662,10 @@ bool resolveLayoutConficts(Value vector, DenseMap<Value, Layout> &layoutMap,
                            DenseMap<Value, Value> &simdToSimtMap, Location loc,
                            OpBuilder &rewriter) {
   if (!layoutConflicts.count(vector)) return true;
-  Layout currentLayout = layoutMap.at(vector);
-  Layout targetLayout = layoutConflicts.at(vector);
+  Layout targetLayout = layoutMap.at(vector);
+  Layout currentLayout = layoutConflicts.at(vector);
+  currentLayout.debugPrint("!!conflict!! current ");
+  targetLayout.debugPrint("!!conflict!! target ");
   int batch0, batch1;
   for (int i = 0; i < currentLayout.order.size(); i++) {
     SmallVector<int> mismatchedDims;
@@ -634,7 +697,7 @@ bool resolveLayoutConficts(Value vector, DenseMap<Value, Layout> &layoutMap,
       if (isVectorId(dimType)) vecDim = dimType;
       if (isBatchId(dimType)) batchDim = dimType;
     }
-    int ratio = (targetLayout.shape[vecDim] / currentLayout.shape[vecDim]);
+    float ratio = ((float)targetLayout.shape[vecDim] / currentLayout.shape[vecDim]);
     int newBatchSize = currentLayout.shape[batchDim] / ratio;
     if (newBatchSize == 0) return false;
     if (batchDim == DimType::Batch0) {
@@ -671,10 +734,11 @@ bool resolveLayoutConficts(Value vector, DenseMap<Value, Layout> &layoutMap,
   }
   // Overwrite the layout, but fix the batch dims
   layoutMap.erase(vector);
-  Layout newLayout = layoutConflicts.at(vector);
+  Layout newLayout = targetLayout;
   newLayout.shape[DimType::Batch0] = batch0;
   newLayout.shape[DimType::Batch1] = batch1;
   layoutMap.try_emplace(vector, newLayout);
+  newLayout.debugPrint("updated layout");
   return true;
 }
 
@@ -690,22 +754,22 @@ static void distributeContracts(vector::ContractionOp contractOp,
   Value lhs = contractOp.getLhs();
   if (!layoutMap.count(lhs)) return;
   if (!simdToSimtMap.count(lhs)) return;
-  if (!resolveLayoutConficts(lhs, layoutMap, layoutConflicts, simdToSimtMap,
-                             loc, rewriter))
-    return;
+  //if (!resolveLayoutConficts(lhs, layoutMap, layoutConflicts, simdToSimtMap,
+  //                           loc, rewriter))
+  //  return;
   Type elementType = lhs.getType().cast<ShapedType>().getElementType();
   Value rhs = contractOp.getRhs();
   if (!layoutMap.count(rhs)) return;
   if (!simdToSimtMap.count(rhs)) return;
-  if (!resolveLayoutConficts(rhs, layoutMap, layoutConflicts, simdToSimtMap,
-                             loc, rewriter))
-    return;
+  //if (!resolveLayoutConficts(rhs, layoutMap, layoutConflicts, simdToSimtMap,
+  //                           loc, rewriter))
+  //  return;
   Value acc = contractOp.getAcc();
   if (!simdToSimtMap.count(acc)) return;
-  if (layoutConflicts.count(acc))
-    if (!resolveLayoutConficts(acc, layoutMap, layoutConflicts, simdToSimtMap,
-                               loc, rewriter))
-      return;
+  //if (layoutConflicts.count(acc))
+  //  if (!resolveLayoutConficts(acc, layoutMap, layoutConflicts, simdToSimtMap,
+  //                             loc, rewriter))
+  //    return;
   Value contractResult = contractOp.getResult();
   Layout lhsLayout = layoutMap.at(lhs);
   Layout resultLayout = layoutMap.at(contractResult);
@@ -839,7 +903,7 @@ static void distributeReductionBroadcastTranspose(
     vector::MultiDimReductionOp reductionOp, vector::BroadcastOp broadcastOp,
     vector::TransposeOp transposeOp, DenseMap<Value, Layout> &layoutMap,
     DenseMap<Value, Value> &simdToSimtMap, OpBuilder &rewriter,
-    llvm::SetVector<Operation *> &ops) {
+    llvm::SetVector<Operation *> &ops, DenseMap<Value, Layout> &layoutConflicts) {
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(reductionOp);
   Value source = reductionOp.getSource();
@@ -847,6 +911,8 @@ static void distributeReductionBroadcastTranspose(
   if (!layoutMap.count(source)) return;
   if (!simdToSimtMap.count(source)) return;
   if (!broadcastOp) return;
+  if (!transposeOp) return;
+  if (!layoutMap.count(transposeOp.getResult())) return;
   Location loc = reductionOp.getLoc();
   Layout layout = layoutMap.at(source);
   auto reductionDims = llvm::to_vector<4>(
@@ -858,10 +924,7 @@ static void distributeReductionBroadcastTranspose(
   std::array<int, 4> reductionOrder = layout.order[reductionDim];
   std::array<int, 4> parallelOrder = layout.order[!reductionDim];
   Value acc = reductionOp.getAcc();
-  // TODO: Should be able to handle any accumulator type here without
-  // too many problems
-  APFloat floatValue(0.0);
-  if (!matchPattern(acc, m_ConstantFloat(&floatValue))) return;
+  if (!simdToSimtMap.count(acc)) return;
   SmallVector<int64_t> vecShape{
       layout.shape[DimType::Batch0], layout.shape[DimType::Batch1],
       layout.shape[DimType::VecIdZ] * layout.shape[DimType::VecIdY],
@@ -887,8 +950,7 @@ static void distributeReductionBroadcastTranspose(
   }
 
   bodyType loopBody = [&](std::array<int, DimType::NumDims> &state) {
-    Value result = rewriter.create<arith::ConstantOp>(
-        loc, rewriter.getFloatAttr(elementType, floatValue));
+    Value result;
 
     auto reduce = [&](std::array<int, DimType::NumDims> &state) {
       Value vector = simdToSimtMap.at(source);
@@ -922,6 +984,12 @@ static void distributeReductionBroadcastTranspose(
                                     vector, mask);
       }
 
+      // Since this is a broadcasted tensor, we only need to extract the 0th
+      // element
+      result = rewriter.create<vector::ExtractOp>(
+          loc, simdToSimtMap.at(acc),
+          SmallVector<int64_t>{state[DimType::Batch0], state[DimType::Batch1],
+                               vectorOffset, 0});
       for (int i = 0; i < vShape[0]; i++) {
         Value v = rewriter.create<vector::ExtractOp>(loc, vector,
                                                      SmallVector<int64_t>{i});
@@ -952,14 +1020,11 @@ static void distributeReductionBroadcastTranspose(
   state.fill(0);
   iterate(0, parallelOrder, state, layout, loopBody);
 
-  if (transposeOp)
-    simdToSimtMap.try_emplace(transposeOp.getResult(), output);
-  else
-    simdToSimtMap.try_emplace(broadcastOp.getResult(), output);
-
+  simdToSimtMap.try_emplace(transposeOp.getResult(), output);
+  simdToSimtMap.try_emplace(reductionOp.getResult(), output);
   ops.insert(reductionOp);
   ops.insert(broadcastOp);
-  if (transposeOp) ops.insert(transposeOp);
+  ops.insert(transposeOp);
 }
 
 static void replaceForOpWithNewSignature(RewriterBase &rewriter,
@@ -1093,12 +1158,14 @@ static void distributeElementwise(Operation *op,
                                   DenseMap<Value, Layout> &layoutMap,
                                   DenseMap<Value, Value> &simdToSimtMap,
                                   IRRewriter &rewriter,
-                                  llvm::SetVector<Operation *> &ops) {
+                                  llvm::SetVector<Operation *> &ops,
+                                  DenseMap<Value, Layout> &layoutConflicts) {
   if (!OpTrait::hasElementwiseMappableTraits(op)) return;
   if (op->getNumResults() != 1) return;
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(op);
   SmallVector<Value> newOperands;
+  Location loc = op->getLoc();
   for (auto operand : op->getOperands()) {
     if (!simdToSimtMap.count(operand)) return;
     newOperands.push_back(simdToSimtMap.at(operand));
@@ -1108,7 +1175,20 @@ static void distributeElementwise(Operation *op,
       rewriter.create(op->getLoc(), op->getName().getIdentifier(), newOperands,
                       resultTypes, op->getAttrs());
   simdToSimtMap.try_emplace(op->getResult(0), newOp->getResult(0));
+  if (!resolveLayoutConficts(op->getResult(0), layoutMap, layoutConflicts, simdToSimtMap,
+                             loc, rewriter)) return;
   ops.insert(op);
+}
+
+static void distributeInnerBroadcast(vector::BroadcastOp broadcastOp, vector::TransposeOp transposeOp,
+                                     DenseMap<Value, Layout> &layoutMap,
+                                     DenseMap<Value, Value> &simdToSimtMap,
+                                     IRRewriter &rewriter,
+                                     llvm::SetVector<Operation *> &ops) {
+  Value src = broadcastOp.getSource();
+  if (!simdToSimtMap.count(src)) return;
+  simdToSimtMap.try_emplace(transposeOp.getResult(), simdToSimtMap.at(src));
+  ops.insert(transposeOp);
 }
 
 static void eraseOps(llvm::SetVector<Operation *> &opsToErase,
@@ -1148,6 +1228,38 @@ static bool isMatmulTransposeB(vector::ContractionOp contractOp) {
   return maps == infer({{m, k}, {n, k}, {m, n}});
 }
 
+void reorderTranspose(IRRewriter &rewriter, func::FuncOp funcOp) {
+  SmallVector<vector::TransposeOp> transposeOps;
+  funcOp.walk([&](Operation *op) {
+    if (auto transposeOp = dyn_cast<vector::TransposeOp>(op)) {
+      Operation *definingOp = transposeOp.getVector().getDefiningOp();
+      if (OpTrait::hasElementwiseMappableTraits(definingOp)) {
+        transposeOps.push_back(transposeOp);
+      }
+    }
+    return WalkResult::advance();
+  });
+
+  for (auto transposeOp : transposeOps) {
+    OpBuilder::InsertionGuard g(rewriter);
+    Operation *op = transposeOp.getVector().getDefiningOp();
+    rewriter.setInsertionPoint(op);
+    SmallVector<int64_t> perm;
+    transposeOp.getTransp(perm);
+    SmallVector<Value> transposedOperands;
+    for (auto operand : op->getOperands()) {
+      Value transposed = rewriter.create<vector::TransposeOp>(op->getLoc(),
+                                                              operand, perm);
+      transposedOperands.push_back(transposed);
+    }
+    SmallVector<Type> resultTypes{transposedOperands.front().getType()};
+    Operation *newOp =
+      rewriter.create(op->getLoc(), op->getName().getIdentifier(), transposedOperands,
+                      resultTypes, op->getAttrs());
+    rewriter.replaceAllUsesWith(transposeOp.getResult(), newOp->getResult(0));
+  }
+}
+
 void doLayoutAnalysisAndDistribution(IRRewriter &rewriter,
                                      func::FuncOp funcOp) {
   // First walk through all the MMA ops and set their layouts
@@ -1169,7 +1281,7 @@ void doLayoutAnalysisAndDistribution(IRRewriter &rewriter,
   funcOp.walk([&](Operation *op) {
     if (auto contractOp = dyn_cast<vector::ContractionOp>(op))
       return WalkResult::advance();
-    propagateLayout(op, layoutMap);
+    propagateLayout(op, layoutMap, layoutConflicts);
     return WalkResult::advance();
   });
 
@@ -1193,11 +1305,19 @@ void doLayoutAnalysisAndDistribution(IRRewriter &rewriter,
                                opsToErase);
     }
     if (auto reductionOp = dyn_cast<vector::MultiDimReductionOp>(op)) {
-      auto [broadcastOp, transposeOp] =
-          checkForReduceBroadcastTranspose(reductionOp);
-      distributeReductionBroadcastTranspose(
-          reductionOp, broadcastOp, transposeOp, layoutMap, simdToSimtMap,
-          rewriter, opsToErase);
+      auto pairs = checkForReduceBroadcastTranspose(reductionOp);
+      Value result;
+      for (auto [broadcastOp, transposeOp] : pairs) {
+        if (!result) {
+          distributeReductionBroadcastTranspose(
+              reductionOp, broadcastOp, transposeOp, layoutMap, simdToSimtMap,
+              rewriter, opsToErase, layoutConflicts);
+          result = transposeOp.getResult();
+        } else {
+          simdToSimtMap.try_emplace(transposeOp.getResult(), simdToSimtMap.at(result));
+        }
+      }
+      if (!result) continue;
     }
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       distributeFor(forOp, layoutMap, simdToSimtMap, rewriter, opsToErase);
@@ -1209,7 +1329,16 @@ void doLayoutAnalysisAndDistribution(IRRewriter &rewriter,
       distributeConstants(constantOp, layoutMap, simdToSimtMap, rewriter,
                           opsToErase);
     }
-    distributeElementwise(op, layoutMap, simdToSimtMap, rewriter, opsToErase);
+    if (auto broadcastOp = dyn_cast<vector::BroadcastOp>(op)) {
+      if (broadcastOp.getSource().getDefiningOp<vector::MultiDimReductionOp>())
+        continue;
+      opsToErase.insert(broadcastOp);
+      for (Operation *user : broadcastOp->getResult(0).getUsers()) {
+        if (auto transposeOp = dyn_cast<vector::TransposeOp>(user))
+          distributeInnerBroadcast(broadcastOp, transposeOp, layoutMap, simdToSimtMap, rewriter, opsToErase);
+      }
+    }
+    distributeElementwise(op, layoutMap, simdToSimtMap, rewriter, opsToErase, layoutConflicts);
   }
 
   // Erase old ops
