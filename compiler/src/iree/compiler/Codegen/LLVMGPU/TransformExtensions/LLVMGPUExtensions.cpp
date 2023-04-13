@@ -810,7 +810,8 @@ transform_dialect::LayoutAnalysisAndDistributionOp::applyToOne(
 //===---------------------------------------------------------------------===//
 // ReorderTransposeOp
 //===---------------------------------------------------------------------===//
-DiagnosedSilenceableFailure transform_dialect::ReorderTransposeOp::applyToOne(
+DiagnosedSilenceableFailure
+transform_dialect::ReorderTransposeOp::applyToOne(
     func::FuncOp target, transform::ApplyToEachResultList &results,
     transform::TransformState &state) {
   IRRewriter rewriter(getContext());
