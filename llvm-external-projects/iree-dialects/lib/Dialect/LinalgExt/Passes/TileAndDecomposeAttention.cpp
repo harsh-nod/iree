@@ -11,6 +11,8 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/Utils/Utils.h"
@@ -154,8 +156,8 @@ static Value computeQKTranspose(Value query, Value key, Value output,
   return matmulOp.getResult(0);
 }
 
-static std::tuple<Value, Value, Value, Value>
-extractSlices(Value key, Value value, Value query, Value output,
+static std::tuple<Value, Value>
+extractSlices(Value key, Value value,
               ArrayRef<int64_t> queryShape, ArrayRef<Value> ivs,
               OpFoldResult sequenceTileLength, Type elementType, Location loc,
               OpBuilder &builder) {
@@ -175,14 +177,7 @@ extractSlices(Value key, Value value, Value query, Value output,
       loc, tensorType, key, offsets, sizes, strides);
   Value valueSlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, value, offsets, sizes, strides);
-
-  offsets = SmallVector<OpFoldResult>(queryShape.size(), zero);
-  offsets[0] = ivs[0];
-  Value querySlice = builder.create<tensor::ExtractSliceOp>(
-      loc, tensorType, query, offsets, sizes, strides);
-  Value outputSlice = builder.create<tensor::ExtractSliceOp>(
-      loc, tensorType, output, offsets, sizes, strides);
-  return std::make_tuple(keySlice, valueSlice, querySlice, outputSlice);
+  return std::make_tuple(keySlice, valueSlice);
 }
 
 static std::tuple<Value, Value, Value>
@@ -199,12 +194,80 @@ insertSlices(Value newResult, Value result, Value newMax, Value max,
   sizes[1] = sequenceTileLength;
   sizes[2] = headDimension;
   offsets[0] = ivs[0];
-  Value updatedAcc = builder.create<tensor::InsertSliceOp>(
-      loc, newResult, result, offsets, sizes, strides);
-  offsets = SmallVector<OpFoldResult>(queryShape.size() - 1, zero);
-  sizes = SmallVector<OpFoldResult>{one, sequenceTileLength};
-  strides = SmallVector<OpFoldResult>(queryShape.size() - 1, one);
-  return std::make_tuple(updatedAcc, newMax, newSum);
+  Value updatedAcc = newResult;
+  offsets = SmallVector<OpFoldResult>(queryShape.size() - 2, zero);
+  sizes = SmallVector<OpFoldResult>{sequenceTileLength};
+  strides = SmallVector<OpFoldResult>(queryShape.size() - 2, one);
+  Value updatedMax = builder.create<tensor::InsertSliceOp>(
+      loc, newMax, max, offsets, sizes, strides);
+  Value updatedSum = builder.create<tensor::InsertSliceOp>(
+      loc, newSum, sum, offsets, sizes, strides);
+  return std::make_tuple(updatedAcc, updatedMax, updatedSum);
+}
+
+static std::tuple<Value, Value, Value, Value>
+extractSlicesInner(Value query, Value output, Value max, Value sum,
+                   ArrayRef<int64_t> queryShape, int64_t tileSize,
+                   ArrayRef<Value> ivs, OpFoldResult sequenceTileLength,
+                   Type elementType, Location loc, OpBuilder &builder) {
+  auto one = builder.getIndexAttr(1);
+  auto zero = builder.getIndexAttr(0);
+  auto headDimension = builder.getIndexAttr(queryShape.back());
+  SmallVector<OpFoldResult> strides(queryShape.size(), one);
+  SmallVector<OpFoldResult> sizes(queryShape.size(), one);
+  SmallVector<OpFoldResult> offsets(queryShape.size(), zero);
+  sizes[1] = sequenceTileLength;
+  sizes[2] = headDimension;
+  offsets[0] = ivs[0];
+  offsets[1] = ivs[2];
+  SmallVector<int64_t> tensorShape{tileSize, queryShape[2]};
+  auto tensorType = RankedTensorType::get(tensorShape, elementType);
+  Value querySlice = builder.create<tensor::ExtractSliceOp>(
+      loc, tensorType, query, offsets, sizes, strides);
+  Value outputSlice = builder.create<tensor::ExtractSliceOp>(
+      loc, tensorType, output, offsets, sizes, strides);
+
+  offsets = SmallVector<OpFoldResult>(queryShape.size() - 2, zero);
+  sizes = SmallVector<OpFoldResult>(queryShape.size() - 2, one);
+  strides = SmallVector<OpFoldResult>(queryShape.size() - 2, one);
+  offsets[0] = ivs[2];
+  sizes[0] = sequenceTileLength;
+  tensorShape = SmallVector<int64_t>{tileSize};
+  tensorType = RankedTensorType::get(tensorShape, elementType);
+  Value maxSlice = builder.create<tensor::ExtractSliceOp>(
+      loc, tensorType, max, offsets, sizes, strides);
+  Value sumSlice = builder.create<tensor::ExtractSliceOp>(
+      loc, tensorType, sum, offsets, sizes, strides);
+
+  return std::make_tuple(querySlice, outputSlice, maxSlice, sumSlice);
+}
+
+static void insertSlicesInner(Value newResult, Value result, Value newMax,
+                              Value max, Value newSum, Value sum,
+                              ArrayRef<int64_t> queryShape, ArrayRef<Value> ivs,
+                              OpFoldResult sequenceTileLength, Location loc,
+                              OpBuilder &builder) {
+  auto one = builder.getIndexAttr(1);
+  auto zero = builder.getIndexAttr(0);
+  auto headDimension = builder.getIndexAttr(queryShape.back());
+  SmallVector<OpFoldResult> strides(queryShape.size(), one);
+  SmallVector<OpFoldResult> sizes(queryShape.size(), one);
+  SmallVector<OpFoldResult> offsets(queryShape.size(), zero);
+  sizes[1] = sequenceTileLength;
+  sizes[2] = headDimension;
+  offsets[0] = ivs[0];
+  offsets[1] = ivs[2];
+  builder.create<tensor::ParallelInsertSliceOp>(loc, newResult, result, offsets,
+                                                sizes, strides);
+  offsets = SmallVector<OpFoldResult>(queryShape.size() - 2, zero);
+  offsets[0] = ivs[2];
+  sizes = SmallVector<OpFoldResult>{sequenceTileLength};
+  strides = SmallVector<OpFoldResult>(queryShape.size() - 2, one);
+  builder.create<tensor::ParallelInsertSliceOp>(loc, newMax, max, offsets,
+                                                sizes, strides);
+  builder.create<tensor::ParallelInsertSliceOp>(loc, newSum, sum, offsets,
+                                                sizes, strides);
+  return;
 }
 
 static scf::LoopNest createLoopNest(SmallVectorImpl<Value> &ivs, Value lb,
@@ -225,6 +288,7 @@ static scf::LoopNest createLoopNest(SmallVectorImpl<Value> &ivs, Value lb,
 static std::tuple<Value, Value, Value>
 createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
                     Value outputSlice, Value maxSlice, Value sumSlice,
+                    OpFoldResult tileSize,
                     OpFoldResult sequenceTileLength, OpFoldResult headDimension,
                     Type elementType, SmallVectorImpl<Operation *> &ops,
                     Location loc, OpBuilder &builder) {
@@ -232,7 +296,7 @@ createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
   // Compute matmul(q, transpose(k))
   Value zero =
       builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(elementType));
-  SmallVector<OpFoldResult> resultShape{sequenceTileLength, sequenceTileLength};
+  SmallVector<OpFoldResult> resultShape{tileSize, sequenceTileLength};
   Value emptySquare =
       builder.create<tensor::EmptyOp>(loc, resultShape, elementType);
   Value qkTranspose = computeQKTranspose(querySlice, keySlice, emptySquare,
@@ -252,7 +316,7 @@ createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
 
   // Update accumulator
   Value empty = builder.create<tensor::EmptyOp>(
-      loc, SmallVector<OpFoldResult>{sequenceTileLength, headDimension},
+      loc, SmallVector<OpFoldResult>{tileSize, headDimension},
       elementType);
   Value scaledAcc = scaleAccumulator(outputSlice, scaledOldSum, newSum, empty,
                                      loc, builder, ops);
@@ -291,11 +355,26 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
       tensor::createDimValues(rewriter, loc, key);
   OpFoldResult sequenceLength = keyDimValues[1];
 
+  bufferization::BufferizationOptions options;
+  FailureOr<Value> ret = bufferization::allocateTensorForShapedValue(
+                rewriter, loc, query, false, options, true);
+  if (failed(ret)) {
+    return {};
+  }
+  query = ret.value();
+
+  Value output = attnOp.getOutput();
+  ret = bufferization::allocateTensorForShapedValue(
+                rewriter, loc, output, false, options, true);
+  if (failed(ret)) {
+    return {};
+  }
+  output = ret.value();
+
   // Construct first loop
   Value zeroValue = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   Value oneValue = rewriter.create<arith::ConstantIndexOp>(loc, 1);
   SmallVector<Value> ivs;
-  Value output = attnOp.getOutput();
   scf::LoopNest firstLoopNest = createLoopNest(
       ivs, zeroValue, oneValue,
       getValueOrCreateConstantIndexOp(rewriter, loc, batchTileLength),
@@ -338,22 +417,80 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   rewriter.setInsertionPointToStart(secondLoopNest.loops.back().getBody());
 
   // Extract slices
-  auto [keySlice, valueSlice, querySlice, outputSlice] =
-      extractSlices(key, value, query, iterArgResult, queryShape, ivs,
+  auto [keySlice, valueSlice] =
+      extractSlices(key, value, queryShape, ivs,
                     sequenceTileLength, elementType, loc, rewriter);
+
+  ret = bufferization::allocateTensorForShapedValue(
+                rewriter, loc, keySlice, false, options, true);
+  if (failed(ret)) {
+    return {};
+  }
+  keySlice = ret.value();
+
+  ret = bufferization::allocateTensorForShapedValue(
+                rewriter, loc, valueSlice, false, options, true);
+  if (failed(ret)) {
+    return {};
+  }
+  valueSlice = ret.value();
+
+  // Construct third loop
+  int64_t tileSize{32};
+  OpFoldResult warpSize = rewriter.getIndexAttr(tileSize);
+  // Number of warps to distribute on
+  OpFoldResult numWarps = rewriter.getIndexAttr(4);
+  SmallVector<Attribute> warpMapping{mlir::gpu::GPUWarpMappingAttr::get(rewriter.getContext(), mlir::gpu::Warps::DimX)};
+  scf::ForallOp forallOp = rewriter.create<scf::ForallOp>(
+      loc, numWarps, ValueRange({iterArgResult, iterArgMax, iterArgSum}),
+      rewriter.getArrayAttr(warpMapping));
+  auto threadIds = llvm::to_vector(forallOp.getInductionVars());
+  ivs.push_back(threadIds[0]);
+  ops.push_back(forallOp);
+  ArrayRef<BlockArgument> bbArgs = forallOp.getOutputBlockArguments();
+  assert(bbArgs.size() == 3);
+  Value iterArgResultInner = bbArgs[0];
+  Value iterArgMaxInner = bbArgs[1];
+  Value iterArgSumInner = bbArgs[2];
+
+  OpBuilder::InsertionGuard guardThirdLoop(rewriter);
+  rewriter.setInsertionPointToStart(forallOp.getBody(0));
+
+  AffineExpr d0;
+  bindDims(rewriter.getContext(), d0);
+  auto threadMap =
+      AffineMap::get(1, 0, {d0 * rewriter.getAffineConstantExpr(tileSize)},
+                     rewriter.getContext());
+  ivs[2] = rewriter.create<AffineApplyOp>(loc, threadMap, ivs[2]);
+
+  // Extract slices
+  auto [querySlice, outputSlice, maxSlice, sumSlice] = extractSlicesInner(
+      query, iterArgResultInner, iterArgMaxInner, iterArgSumInner, queryShape,
+      tileSize, ivs, warpSize, elementType, loc, rewriter);
 
   // Create body of innermost loop
   auto [result, newMax, newSum] = createAttentionBody(
-      keySlice, valueSlice, querySlice, outputSlice, iterArgMax, iterArgSum,
+      keySlice, valueSlice, querySlice, outputSlice, maxSlice, sumSlice, warpSize,
       sequenceTileLength, headDimension, elementType, ops, loc, rewriter);
 
-  // Insert slices
-  auto [updatedAcc, updatedMax, updatedSum] = insertSlices(
-      result, iterArgResult, newMax, iterArgMax, newSum, iterArgSum, queryShape,
-      ivs, sequenceTileLength, loc, rewriter);
+  OpBuilder::InsertionGuard guardThirdLoopEnd(rewriter);
+  rewriter.setInsertionPointToStart(forallOp.getTerminator().getBody());
+
+  // Insert slices inner
+  insertSlicesInner(result, iterArgResultInner, newMax, iterArgMaxInner, newSum,
+                    iterArgSumInner, queryShape, ivs, warpSize, loc, rewriter);
 
   if (scf::YieldOp yieldOp = dyn_cast<scf::YieldOp>(
           secondLoopNest.loops.back().getBody()->getTerminator())) {
+    // Insert slices
+    OpBuilder::InsertionGuard yieldGuard(rewriter);
+    rewriter.setInsertionPoint(yieldOp);
+    result = forallOp.getResult(0);
+    newMax = forallOp.getResult(1);
+    newSum = forallOp.getResult(2);
+    auto [updatedAcc, updatedMax, updatedSum] = insertSlices(
+        result, iterArgResult, newMax, iterArgMax, newSum, iterArgSum, queryShape,
+        ivs, sequenceTileLength, loc, rewriter);
     rewriter.replaceOpWithNewOp<scf::YieldOp>(
         yieldOp, ValueRange{updatedAcc, updatedMax, updatedSum});
   }
@@ -415,6 +552,7 @@ struct TileAndDecomposeAttentionPass
     : public TileAndDecomposeAttentionBase<TileAndDecomposeAttentionPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<AffineDialect, IREE::LinalgExt::IREELinalgExtDialect,
+                    gpu::GPUDialect,
                     linalg::LinalgDialect, scf::SCFDialect,
                     tensor::TensorDialect>();
   }
