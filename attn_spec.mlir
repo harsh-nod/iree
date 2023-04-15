@@ -8,7 +8,7 @@ transform.sequence failures(propagate) {
     // Tile and distribute to workgroups
     // ==========================================
     %forall_grid, %tiled_attention =
-    transform.structured.tile_to_forall_op %attention tile_sizes [1, 64]
+    transform.iree.tile_to_forall_and_workgroup_count_region %attention tile_sizes [1, 64]
       ( mapping = [#gpu.block<x>, #gpu.block<y>] )
 
     // Tile and decompose attention
@@ -43,7 +43,7 @@ transform.sequence failures(propagate) {
     // ===========================================================================
     %func_7 = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
     transform.iree.forall_to_workgroup %func_7 : (!pdl.operation) -> ()
-    transform.iree.map_nested_forall_to_gpu_threads %func_7 workgroup_dims = [128, 1, 1] warp_dims = [4, 1, 1] : (!pdl.operation) -> ()
+    transform.iree.map_nested_forall_to_gpu_threads %func_7 workgroup_dims = [4, 8, 1] warp_dims = [4, 1, 1] : (!pdl.operation) -> ()
 
     %func_8 = transform.structured.hoist_redundant_vector_transfers %memref_func
     : (!pdl.operation) -> !pdl.operation
@@ -51,4 +51,11 @@ transform.sequence failures(propagate) {
     transform.iree.apply_patterns %func_8 { cse } : (!pdl.operation) -> ()
     transform.iree.apply_patterns %func_8 { canonicalization } : (!pdl.operation) -> ()
     transform.iree.apply_buffer_optimizations %func_8 : (!pdl.operation) -> ()
+
+    // Step 7. Do layout analysis and lower to mma
+    // ===========================================================================
+    %func_10 = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
+    %reordered_func = transform.iree.reorder_transpose %func_10 : (!pdl.operation) -> !pdl.operation
+    transform.iree.apply_patterns %reordered_func { cse } : (!pdl.operation) -> ()
+    %func_11 = transform.iree.layout_analysis_and_distribution %reordered_func : (!pdl.operation) -> (!pdl.operation)
 }

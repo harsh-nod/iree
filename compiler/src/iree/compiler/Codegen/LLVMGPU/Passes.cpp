@@ -570,6 +570,10 @@ void buildLLVMGPUTransformPassPipeline(OpPassManager &pm, bool useROCM) {
   pm.nest<ModuleOp>().addNestedPass<func::FuncOp>(
       createEraseHALDescriptorTypeFromMemRefPass());
   pm.addPass(createLLVMGPULowerExecutableTargetPass());
+  pm.nest<ModuleOp>().addNestedPass<func::FuncOp>(
+      createGPUDistributeSharedMemoryCopy());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
   OpPassManager &nestedModulePM = pm.nest<ModuleOp>();
   //===--------------------------------------------------------------------===//
   // Convert Linalg ops to LLVM+NVVM/ROCDL ops.

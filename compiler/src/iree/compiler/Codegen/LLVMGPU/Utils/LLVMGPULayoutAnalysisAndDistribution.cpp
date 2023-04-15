@@ -581,10 +581,11 @@ static void distributeTransferReads(vector::TransferReadOp readOp,
   Location loc = readOp.getLoc();
   SmallVector<Value> indices = readOp.getIndices();
   Type elementType = source.getType().cast<ShapedType>().getElementType();
+  Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   std::array<Value, 3> threadIds = {
       rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x),
       rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::y),
-      rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::z)};
+      zero};
   Layout layout = layoutMap.at(result);
   auto vecType = VectorType::get(
       {layout.shape[DimType::Batch0], layout.shape[DimType::Batch1],
@@ -715,17 +716,18 @@ bool resolveLayoutConficts(Value vector, DenseMap<Value, Layout> &layoutMap,
     Value newVector = rewriter.create<arith::ConstantOp>(
         loc, vecType, rewriter.getZeroAttr(vecType));
     for (int i = 0; i < currentLayout.shape[DimType::Batch0]; i++) {
-      for (int j = 0; j < currentLayout.shape[DimType::Batch1]; j++) {
+      for (int j = 0, offset = 0; j < currentLayout.shape[DimType::Batch1]; j++) {
         Value slice = rewriter.create<vector::ExtractOp>(
             loc, simdToSimtMap.at(vector), SmallVector<int64_t>{i, j});
         int newI = batchDim == DimType::Batch0 ? i / ratio : i;
         int newJ = batchDim == DimType::Batch0 ? j : j / ratio;
-        int newK = vecDim == DimType::VecIdX ? 0 : j * ratio;
-        int newL = vecDim == DimType::VecIdX ? j * ratio : 0;
+        int newK = vecDim == DimType::VecIdX ? 0 : ratio * offset;
+        int newL = vecDim == DimType::VecIdX ? ratio * offset : 0;
         SmallVector<int64_t> offsets{newI, newJ, newK, newL};
         SmallVector<int64_t> strides{1, 1};
         newVector = rewriter.create<vector::InsertStridedSliceOp>(
             loc, slice, newVector, offsets, strides);
+        offset = (offset + 1) % ((int)ratio);
       }
     }
     // Overwrite the value mapping
@@ -817,10 +819,11 @@ static void distributeTransferWrites(vector::TransferWriteOp writeOp,
   Value source = writeOp.getSource();
   Location loc = writeOp.getLoc();
   SmallVector<Value> indices = writeOp.getIndices();
+  Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   std::array<Value, 3> threadIds = {
       rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::x),
       rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::y),
-      rewriter.create<gpu::ThreadIdOp>(loc, gpu::Dimension::z)};
+      zero};
   if (!layoutMap.count(vector)) return;
   if (!simdToSimtMap.count(vector)) return;
   Layout layout = layoutMap.at(vector);
