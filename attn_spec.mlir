@@ -43,7 +43,7 @@ transform.sequence failures(propagate) {
     // ===========================================================================
     %func_7 = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
     transform.iree.forall_to_workgroup %func_7 : (!pdl.operation) -> ()
-    transform.iree.map_nested_forall_to_gpu_threads %func_7 workgroup_dims = [4, 8, 1] warp_dims = [4, 1, 1] : (!pdl.operation) -> ()
+    transform.iree.map_nested_forall_to_gpu_threads %func_7 workgroup_dims = [4, 8, 4] warp_dims = [4, 1, 1] : (!pdl.operation) -> ()
 
     %func_8 = transform.structured.hoist_redundant_vector_transfers %memref_func
     : (!pdl.operation) -> !pdl.operation
