@@ -436,7 +436,7 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   valueSlice = ret.value();
 
   // Construct third loop
-  int64_t tileSize{32};
+  int64_t tileSize{16};
   OpFoldResult warpSize = rewriter.getIndexAttr(tileSize);
   // Number of warps to distribute on
   OpFoldResult numWarps = rewriter.getIndexAttr(4);
