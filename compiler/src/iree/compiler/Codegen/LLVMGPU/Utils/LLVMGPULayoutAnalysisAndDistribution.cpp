@@ -88,6 +88,20 @@ struct Layout {
   int reductionDim;
 };
 
+struct LayoutHash {
+  size_t operator()(const Layout &layout) const {
+    size_t hash;
+    for (int i = 0; i < DimType::NumDims; i++) {
+      if (i == 0) {
+        hash = std::hash<int>()(layout.shape[i]);
+      } else {
+        hash = hash ^ (std::hash<int>()(layout.shape[i]) << i);
+      }
+    }
+    return hash;
+  }
+};
+
 // MMA Layout Utilities
 enum class MMAType {
   M16N8K16,
@@ -314,18 +328,18 @@ static void propagateLayoutToReduceBroadcastTranspose(
     int64_t dim = dimAttr.getInt();
     int64_t transposedDim = perm[dim];
     if (!broadcastedDims.contains(transposedDim)) return;
-    if (srcShape[dim] != broadcastShape[transposedDim]) return;
+    if (srcShape[dim] < broadcastShape[transposedDim]) return;
   }
   Value transposedResult = transposeOp.getResult();
-  layoutMap.try_emplace(transposedResult, layoutMap.at(reductionSrc));
+  Layout newLayout = layoutMap.at(reductionSrc);
+  newLayout.rank = 1;
+  newLayout.reductionDim = reductionDims[0].getInt();
+  layoutMap.try_emplace(transposedResult, newLayout);
   layoutMap.at(transposedResult).debugPrint("transposed");
   // Propagate 2D layout to 1D accumulator
   Value acc = reductionOp.getAcc();
   if (layoutMap.count(acc)) return;
-  Layout accLayout = layoutMap.at(reductionSrc);
-  accLayout.rank = 1;
-  accLayout.reductionDim = reductionDims[0].getInt();
-  layoutMap.try_emplace(acc, accLayout);
+  layoutMap.try_emplace(acc, newLayout);
   layoutMap.at(acc).debugPrint("accumulator");
 }
 
@@ -368,26 +382,60 @@ static void propagateLayoutToOthers(SmallVectorImpl<Value> &operands,
                                     DenseMap<Value, Layout> &layoutMap,
                                     DenseMap<Value, Layout> &layoutConflicts) {
   int numOperands = operands.size();
-  // Find an operand with a layout
-  int i;
-  bool success{false};
-  for (i = 0; i < numOperands; i++) {
+
+  struct LayoutInfo {
+    int count;
+    int index;
+  };
+
+  // Find the most common layout
+  std::unordered_map<Layout, LayoutInfo, LayoutHash> layoutInfo;
+  int rank{-1};
+  int index{-1};
+  int maxLayoutCount{-1};
+  for (int i = 0; i < numOperands; i++) {
     if (layoutMap.count(operands[i])) {
-      success = true;
-      break;
+      Layout layout = layoutMap.at(operands[i]);
+      if (!layoutInfo.count(layout)) {
+        layoutInfo[layout] = {0, i};
+      }
+      layoutInfo[layout].count++;
+      if (layoutInfo[layout].count > maxLayoutCount) {
+        maxLayoutCount = layoutInfo[layout].count;
+        rank = layout.rank;
+        index = i;
+      }
     }
   }
-  if (!success) return;
+
+  if (index < 0) return;
+
+  // Give preference to higher dimensional tensors when there's a tie
+  for (auto [layout, info] : layoutInfo) {
+    if ((info.count == maxLayoutCount) && (layout.rank > rank)) {
+      index = info.index;
+      rank = layout.rank;
+    }
+  }
+
   // Propagate layout to others
   for (int j = 0; j < numOperands; j++) {
-    if (j == i) continue;
+    if (j == index) continue;
     if (!layoutMap.count(operands[j])) {
-      layoutMap.try_emplace(operands[j], layoutMap.at(operands[i]));
+      layoutMap.try_emplace(operands[j], layoutMap.at(operands[index]));
       layoutMap.at(operands[j]).debugPrint("binary/unary operand");
-    } else if (layoutMap.at(operands[i]) != layoutMap.at(operands[j])) {
-      layoutConflicts.try_emplace(operands[j], layoutMap.at(operands[i]));
+    } else if (layoutMap.at(operands[index]) != layoutMap.at(operands[j])) {
+      LLVM_DEBUG({llvm::dbgs() << "Conflict for operand" << j << "\n";});
+      if (index != operands.size() - 1) {
+        // If result has a layout, probably came from MMA. So switch the order.
+        layoutConflicts.try_emplace(operands[j], layoutMap.at(operands[j]));
+        layoutMap.erase(operands[j]);
+        layoutMap.try_emplace(operands[j], layoutMap.at(operands[index]));
+      } else {
+        layoutConflicts.try_emplace(operands[j], layoutMap.at(operands[index]));
+      }
       layoutMap.at(operands[j]).debugPrint("!!conflict!! current ");
-      layoutMap.at(operands[i]).debugPrint("!!conflict!! expected ");
+      layoutMap.at(operands[index]).debugPrint("!!conflict!! expected ");
     }
   }
 }
@@ -416,9 +464,9 @@ static void propagateLayoutToInnerBroadcast(vector::BroadcastOp broadcastOp,
     for (int dimType : layout.order[i]) {
       size *= layout.shape[dimType];
     }
-    if (size != resultShape[i]) return;
+    if (size < resultShape[i]) return;
   }
-  layoutMap.try_emplace(transposeOp.getResult(), layoutMap.at(src));
+  layoutMap.try_emplace(transposeOp.getResult(), layout);
 }
 
 static void propagateLayout(Operation *op, DenseMap<Value, Layout> &layoutMap,
@@ -825,13 +873,14 @@ static bool isVectorId(int dimType) {
 // 2. Vector conflicts
 // 3. Batch and Vector conflicts
 // Currently, we only handle conflicts of type 3.
-bool resolveLayoutConficts(Value vector, DenseMap<Value, Layout> &layoutMap,
+bool resolveLayoutConficts(Value vector,
+                           DenseMap<Value, Layout> &layoutMap,
                            DenseMap<Value, Layout> &layoutConflicts,
                            DenseMap<Value, Value> &simdToSimtMap, Location loc,
                            OpBuilder &rewriter) {
-  if (!layoutConflicts.count(vector)) return true;
-  Layout targetLayout = layoutMap.at(vector);
-  Layout currentLayout = layoutConflicts.at(vector);
+  if (!layoutConflicts.contains(vector)) return true;
+  Layout currentLayout = layoutMap.at(vector);
+  Layout targetLayout = layoutConflicts.at(vector);
   currentLayout.debugPrint("!!conflict!! current ");
   targetLayout.debugPrint("!!conflict!! target ");
   int batch0, batch1;
@@ -843,10 +892,22 @@ bool resolveLayoutConficts(Value vector, DenseMap<Value, Layout> &layoutMap,
         mismatchedDims.push_back(dimType);
       }
     }
-    // If all the mismatched dims are batch, then there's nothing to do.
+    if (mismatchedDims.empty()) continue;
     if (llvm::all_of(mismatchedDims,
-                     [](int dimType) { return isBatchId(dimType); }))
+                     [](int dimType) { return isBatchId(dimType); })) {
+      int batchDim = mismatchedDims[0];
+      if (currentLayout.shape[batchDim] < targetLayout.shape[batchDim]) return false;
+      ArrayRef<int64_t> vectorShape = simdToSimtMap.at(vector).getType().cast<VectorType>().getShape();
+      SmallVector<int64_t> offsets(vectorShape.size(), 0);
+      SmallVector<int64_t> strides(vectorShape.size(), 1);
+      SmallVector<int64_t> shape(vectorShape);
+      shape[batchDim] = targetLayout.shape[batchDim];
+      Value newVector = rewriter.create<vector::ExtractStridedSliceOp>(loc, simdToSimtMap.at(vector), offsets, shape, strides);
+      simdToSimtMap[vector] = newVector;
+      batch0 = batchDim == DimType::Batch0 ? targetLayout.shape[DimType::Batch0] : currentLayout.shape[DimType::Batch0];
+      batch1 = batchDim == DimType::Batch1 ? targetLayout.shape[DimType::Batch1] : currentLayout.shape[DimType::Batch1];
       continue;
+    }
     // If any of the mismatched dims are laneId, this layout conflict cannot be
     // resolved.
     if (llvm::any_of(mismatchedDims,
@@ -908,6 +969,7 @@ bool resolveLayoutConficts(Value vector, DenseMap<Value, Layout> &layoutMap,
   newLayout.shape[DimType::Batch1] = batch1;
   layoutMap.try_emplace(vector, newLayout);
   newLayout.debugPrint("updated layout");
+  layoutConflicts.erase(vector);
   return true;
 }
 
@@ -1345,8 +1407,9 @@ static void distributeElementwise(Operation *op,
   Operation *newOp =
       rewriter.create(op->getLoc(), op->getName().getIdentifier(), newOperands,
                       resultTypes, op->getAttrs());
-  simdToSimtMap.try_emplace(op->getResult(0), newOp->getResult(0));
-  if (!resolveLayoutConficts(op->getResult(0), layoutMap, layoutConflicts, simdToSimtMap,
+  Value result = op->getResult(0);
+  simdToSimtMap.try_emplace(result, newOp->getResult(0));
+  if (!resolveLayoutConficts(result, layoutMap, layoutConflicts, simdToSimtMap,
                              loc, rewriter)) return;
   ops.insert(op);
 }
@@ -1454,6 +1517,8 @@ void doLayoutAnalysisAndDistribution(IRRewriter &rewriter,
           result = transposeOp.getResult();
         } else {
           simdToSimtMap.try_emplace(transposeOp.getResult(), simdToSimtMap.at(result));
+          opsToErase.insert(broadcastOp);
+          opsToErase.insert(transposeOp);
         }
       }
       if (!result) continue;
