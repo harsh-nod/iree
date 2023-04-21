@@ -438,7 +438,7 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   int64_t tileSize{16};
   OpFoldResult warpSize = rewriter.getIndexAttr(tileSize);
   // Number of warps to distribute on
-  OpFoldResult numWarps = rewriter.getIndexAttr(4);
+  OpFoldResult numWarps = rewriter.getIndexAttr(2);
   SmallVector<Attribute> warpMapping{mlir::gpu::GPUWarpMappingAttr::get(rewriter.getContext(), mlir::gpu::Warps::DimX)};
   scf::ForallOp forallOp = rewriter.create<scf::ForallOp>(
       loc, numWarps, ValueRange({iterArgResult, iterArgMax, iterArgSum}),
