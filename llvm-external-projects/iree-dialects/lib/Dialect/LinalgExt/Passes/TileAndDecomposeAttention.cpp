@@ -133,7 +133,7 @@ static Value scaleAccumulator(Value accumulator, Value scaledOldSum,
   SmallVector<utils::IteratorType> iteratorTypes(2,
                                                  utils::IteratorType::parallel);
   auto genericOp = builder.create<linalg::GenericOp>(
-      loc, accumulator.getType(), ValueRange{accumulator, scaledOldSum, newSum},
+      loc, output.getType(), ValueRange{accumulator, scaledOldSum, newSum},
       output, indexingMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
         Value ratio = b.create<arith::DivFOp>(loc, args[1], args[2]);
@@ -224,6 +224,7 @@ extractSlicesInner(Value query, Value output, Value max, Value sum,
   auto tensorType = RankedTensorType::get(tensorShape, elementType);
   Value querySlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, query, offsets, sizes, strides);
+  tensorType = RankedTensorType::get(tensorShape, builder.getF32Type());
   Value outputSlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, output, offsets, sizes, strides);
 
@@ -233,7 +234,7 @@ extractSlicesInner(Value query, Value output, Value max, Value sum,
   offsets[0] = ivs[2];
   sizes[0] = sequenceTileLength;
   tensorShape = SmallVector<int64_t>{tileSize};
-  tensorType = RankedTensorType::get(tensorShape, elementType);
+  tensorType = RankedTensorType::get(tensorShape, builder.getF32Type());
   Value maxSlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, max, offsets, sizes, strides);
   Value sumSlice = builder.create<tensor::ExtractSliceOp>(
@@ -285,6 +286,48 @@ static scf::LoopNest createLoopNest(SmallVectorImpl<Value> &ivs, Value lb,
   return loopNest;
 }
 
+Value extendToF32(Value input, Value output, OpBuilder &builder, Location loc) {
+  AffineMap identityMap =
+      AffineMap::getMultiDimIdentityMap(3, builder.getContext());
+  AffineExpr d0, d1;
+  bindDims(builder.getContext(), d0, d1);
+  // (d0, d1) -> (d0)
+  auto rowMap = AffineMap::get(3, 0, {d0}, builder.getContext());
+  SmallVector<AffineMap> indexingMaps{identityMap, identityMap};
+  SmallVector<utils::IteratorType> iteratorTypes(3,
+                                                 utils::IteratorType::parallel);
+  auto genericOp = builder.create<linalg::GenericOp>(
+      loc, output.getType(), ValueRange{input},
+      output, indexingMaps, iteratorTypes,
+      [&](OpBuilder &b, Location loc, ValueRange args) {
+        Value result = b.create<arith::ExtFOp>(loc, b.getF32Type(), args[0]);
+        b.create<linalg::YieldOp>(loc, result);
+      });
+  return genericOp.getResult(0);
+}
+
+template <int T>
+Value truncateToF16(Value input, Value output, OpBuilder &builder, Location loc) {
+  AffineMap identityMap =
+      AffineMap::getMultiDimIdentityMap(T, builder.getContext());
+  AffineExpr d0, d1;
+  bindDims(builder.getContext(), d0, d1);
+  // (d0, d1) -> (d0)
+  auto rowMap = AffineMap::get(T, 0, {d0}, builder.getContext());
+  SmallVector<AffineMap> indexingMaps{identityMap, identityMap};
+  SmallVector<utils::IteratorType> iteratorTypes(T,
+                                                 utils::IteratorType::parallel);
+  auto genericOp = builder.create<linalg::GenericOp>(
+      loc, output.getType(), ValueRange{input},
+      output, indexingMaps, iteratorTypes,
+      [&](OpBuilder &b, Location loc, ValueRange args) {
+        Value result = b.create<arith::TruncFOp>(loc, b.getF16Type(), args[0]);
+        b.create<linalg::YieldOp>(loc, result);
+      });
+  return genericOp.getResult(0);
+}
+
+
 static std::tuple<Value, Value, Value>
 createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
                     Value outputSlice, Value maxSlice, Value sumSlice,
@@ -294,11 +337,12 @@ createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
                     Location loc, OpBuilder &builder) {
 
   // Compute matmul(q, transpose(k))
+  Type f32Type = builder.getF32Type();
   Value zero =
-      builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(elementType));
+      builder.create<arith::ConstantOp>(loc, builder.getZeroAttr(f32Type));
   SmallVector<OpFoldResult> resultShape{tileSize, sequenceTileLength};
   Value emptySquare =
-      builder.create<tensor::EmptyOp>(loc, resultShape, elementType);
+      builder.create<tensor::EmptyOp>(loc, resultShape, f32Type);
   Value qkTranspose = computeQKTranspose(querySlice, keySlice, emptySquare,
                                          zero, loc, builder, ops);
 
@@ -314,16 +358,20 @@ createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
   Value softmax =
       scalePartialSoftmax(partialSoftmax, newSum, loc, builder, ops);
 
+  ArrayRef<int64_t> softmaxShape = softmax.getType().cast<ShapedType>().getShape();
+  Value scratch = builder.create<tensor::EmptyOp>(loc, resultShape, builder.getF16Type());
+  softmax = truncateToF16<2>(softmax, scratch, builder, loc);
+
   // Update accumulator
   Value empty = builder.create<tensor::EmptyOp>(
       loc, SmallVector<OpFoldResult>{tileSize, headDimension},
-      elementType);
+      f32Type);
   Value scaledAcc = scaleAccumulator(outputSlice, scaledOldSum, newSum, empty,
                                      loc, builder, ops);
 
   // Compute matmul(softmax, v)
   auto matmulOp = builder.create<linalg::MatmulOp>(
-      loc, outputSlice.getType(), ValueRange{softmax, valueSlice}, scaledAcc);
+      loc, scaledAcc.getType(), ValueRange{softmax, valueSlice}, scaledAcc);
   ops.push_back(matmulOp);
   Value result = matmulOp.getResult(0);
   return std::make_tuple(result, newMax, newSum);
@@ -371,6 +419,11 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   }
   output = ret.value();
 
+  // Extend output to f32
+  ArrayRef<int64_t> outputShape = output.getType().cast<ShapedType>().getShape();
+  Value scratch = rewriter.create<tensor::EmptyOp>(loc, outputShape, rewriter.getF32Type());
+  output = extendToF32(output, scratch, rewriter, loc);
+
   // Construct first loop
   Value zeroValue = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   Value oneValue = rewriter.create<arith::ConstantIndexOp>(loc, 1);
@@ -386,17 +439,18 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   rewriter.setInsertionPointToStart(firstLoopNest.loops.back().getBody());
 
   // Create max and sum statistics
+  Type statType = rewriter.getF32Type();
   Value zeroF32 = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getZeroAttr(elementType));
+      loc, rewriter.getZeroAttr(statType));
   Value largeNegativeF32 = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getFloatAttr(elementType, -1.0e+30));
+      loc, rewriter.getFloatAttr(statType, -1.0e+30));
   SmallVector<OpFoldResult> dims{sequenceTileLength};
-  Value max = rewriter.create<tensor::EmptyOp>(loc, dims, elementType);
+  Value max = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
   auto maxFill =
       rewriter.create<linalg::FillOp>(loc, ValueRange{largeNegativeF32}, max);
   Value negativeMax = maxFill.result();
   ops.push_back(maxFill);
-  Value sum = rewriter.create<tensor::EmptyOp>(loc, dims, elementType);
+  Value sum = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
   auto sumFill = rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, sum);
   Value zeroSum = sumFill.result();
   ops.push_back(sumFill);
@@ -503,7 +557,13 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
         yieldOp, ValueRange{secondLoopNest.results[0]});
   }
 
-  attnOp.getResults()[0].replaceAllUsesWith(firstLoopNest.results[0]);
+  OpBuilder::InsertionGuard forGuard(rewriter);
+  rewriter.setInsertionPointAfter(firstLoopNest.loops[0]);
+  ArrayRef<int64_t> resultShape = firstLoopNest.results[0].getType().cast<ShapedType>().getShape();
+  scratch = rewriter.create<tensor::EmptyOp>(loc, resultShape, rewriter.getF16Type());
+  result = truncateToF16<3>(firstLoopNest.results[0], scratch, rewriter, loc);
+
+  attnOp.getResults()[0].replaceAllUsesWith(result);
   return ops;
 }
 

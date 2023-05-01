@@ -287,6 +287,17 @@ static void setMMALayout(Value aMatrix, Value bMatrix, Value cMatrix,
   setLayout(bMatrix, MMAMatrixType::BMatrix, "bMatrix");
   setLayout(cMatrix, MMAMatrixType::CMatrix, "cMatrix");
   setLayout(dMatrix, MMAMatrixType::CMatrix, "dMatrix");
+  // Propagation for extF ops
+  auto passthroughLayout = [&](Value matrix) {
+    if (auto extOp = matrix.getDefiningOp<arith::ExtFOp>()) {
+      layoutMap.try_emplace(extOp.getResult(), layoutMap.at(matrix));
+      layoutMap.try_emplace(extOp.getOperand(), layoutMap.at(matrix));
+      layoutMap.at(extOp.getResult()).debugPrint("extResult");
+      layoutMap.at(extOp.getOperand()).debugPrint("extOperand");
+    }
+  };
+  passthroughLayout(aMatrix);
+  passthroughLayout(bMatrix);
 }
 
 static void propagateLayoutToReduceBroadcastTranspose(
@@ -411,10 +422,16 @@ static void propagateLayoutToOthers(SmallVectorImpl<Value> &operands,
   if (index < 0) return;
 
   // Give preference to higher dimensional tensors when there's a tie
+  // and to result tensors if all are the same dimension
   for (auto [layout, info] : layoutInfo) {
-    if ((info.count == maxLayoutCount) && (layout.rank > rank)) {
-      index = info.index;
-      rank = layout.rank;
+    if (info.count == maxLayoutCount) {
+      if (layout.rank > rank) {
+        index = info.index;
+        rank = layout.rank;
+      }
+      if ((layout.rank == rank) && (info.index > index)) {
+        index = info.index;
+      }
     }
   }
 
@@ -425,7 +442,6 @@ static void propagateLayoutToOthers(SmallVectorImpl<Value> &operands,
       layoutMap.try_emplace(operands[j], layoutMap.at(operands[index]));
       layoutMap.at(operands[j]).debugPrint("binary/unary operand");
     } else if (layoutMap.at(operands[index]) != layoutMap.at(operands[j])) {
-      LLVM_DEBUG({llvm::dbgs() << "Conflict for operand" << j << "\n";});
       if (index != operands.size() - 1) {
         // If result has a layout, probably came from MMA. So switch the order.
         layoutConflicts.try_emplace(operands[j], layoutMap.at(operands[j]));
@@ -1200,21 +1216,47 @@ static void distributeReductionBroadcastTranspose(
           loc, vector,
           SmallVector<int64_t>{state[DimType::Batch0], state[DimType::Batch1],
                                vectorOffset});
-      ArrayRef<int64_t> vShape = vector.getType().cast<VectorType>().getShape();
+      VectorType vType = vector.getType().cast<VectorType>();
+      ArrayRef<int64_t> vShape = vType.getShape();
       assert(vShape.size() == 1);
+
+      Type elementType = vType.getElementType();
+      int bitWidth = elementType.getIntOrFloatBitWidth();
 
       uint32_t size{32};
       Value mask;
-      for (uint64_t i = offset; i < offset * layout.shape[dimType]; i <<= 1) {
-        Value packed = packVectorToSupportedWidth(loc, rewriter, vector);
-        auto shuffleOp = rewriter.create<gpu::ShuffleOp>(loc, packed, i, size,
-                                                         gpu::ShuffleMode::XOR);
-        Value unpacked =
-            unpackToVector(loc, rewriter, shuffleOp.getShuffleResult(),
-                           vector.getType().cast<VectorType>());
-        vector = makeArithReduction(rewriter, loc, combiningKind, unpacked,
-                                    vector, mask);
+
+      Value newVector = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(vector.getType()));
+      Value slice = vector;
+      for (int n = 0; n < bitWidth / 16; n++) {
+
+        if (bitWidth > 16) {
+          SmallVector<int64_t> offset{n};
+          SmallVector<int64_t> one{1};
+          slice = rewriter.create<vector::ExtractStridedSliceOp>(loc, vector, offset, one, one);
+        }
+
+        for (uint64_t i = offset; i < offset * layout.shape[dimType]; i <<= 1) {
+          Value packed = packVectorToSupportedWidth(loc, rewriter, slice);
+          auto shuffleOp = rewriter.create<gpu::ShuffleOp>(loc, packed, i, size,
+                                                           gpu::ShuffleMode::XOR);
+          Value unpacked =
+              unpackToVector(loc, rewriter, shuffleOp.getShuffleResult(),
+                             slice.getType().cast<VectorType>());
+          slice = makeArithReduction(rewriter, loc, combiningKind, unpacked,
+                                      slice, mask);
+        }
+
+        if (bitWidth > 16) {
+          SmallVector<int64_t> offset{n};
+          SmallVector<int64_t> one{1};
+          newVector = rewriter.create<vector::InsertStridedSliceOp>(loc, slice, newVector, offset, one);
+        }
+
       }
+
+      if (bitWidth > 16)
+        vector = newVector;
 
       // Since this is a broadcasted tensor, we only need to extract the 0th
       // element
@@ -1395,6 +1437,17 @@ static void distributeElementwise(Operation *op,
                                   DenseMap<Value, Layout> &layoutConflicts) {
   if (!OpTrait::hasElementwiseMappableTraits(op)) return;
   if (op->getNumResults() != 1) return;
+  // Passthrough ext ops of contract operands
+  if (auto extOp = dyn_cast<arith::ExtFOp>(op)) {
+    for (Operation *user : extOp.getResult().getUsers()) {
+      if (auto contractOp = dyn_cast<vector::ContractionOp>(user)) {
+        if (!simdToSimtMap.count(extOp.getOperand())) return;
+        simdToSimtMap.try_emplace(extOp.getResult(), simdToSimtMap.at(extOp.getOperand()));
+        ops.insert(op);
+        return;
+      }
+    }
+  }
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(op);
   SmallVector<Value> newOperands;
@@ -1403,7 +1456,13 @@ static void distributeElementwise(Operation *op,
     if (!simdToSimtMap.count(operand)) return;
     newOperands.push_back(simdToSimtMap.at(operand));
   }
-  SmallVector<Type> resultTypes{newOperands.front().getType()};
+  VectorType simdResultType = op->getResult(0).getType().cast<VectorType>();
+  VectorType simtOperandType = newOperands.front().getType().cast<VectorType>();
+  VectorType simtResultType = simtOperandType;
+  if (simdResultType.getElementType() != simtOperandType.getElementType()) {
+    simtResultType = VectorType::get(simtOperandType.getShape(), simdResultType.getElementType());
+  }
+  SmallVector<Type> resultTypes{simtResultType};
   Operation *newOp =
       rewriter.create(op->getLoc(), op->getName().getIdentifier(), newOperands,
                       resultTypes, op->getAttrs());

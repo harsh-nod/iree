@@ -8,7 +8,7 @@ transform.sequence failures(propagate) {
     // Tile and distribute to workgroups
     // ==========================================
     %forall_grid, %tiled_attention =
-    transform.iree.tile_to_forall_and_workgroup_count_region %attention tile_sizes [1, 256]
+    transform.iree.tile_to_forall_and_workgroup_count_region %attention tile_sizes [1, 128]
       ( mapping = [#gpu.block<x>, #gpu.block<y>] )
 
     // Tile and decompose attention
@@ -57,5 +57,9 @@ transform.sequence failures(propagate) {
     %func_10 = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
     %reordered_func = transform.iree.reorder_transpose %func_10 : (!pdl.operation) -> !pdl.operation
     transform.iree.apply_patterns %reordered_func { cse } : (!pdl.operation) -> ()
-    %func_11 = transform.iree.layout_analysis_and_distribution %reordered_func : (!pdl.operation) -> (!pdl.operation)
+    %reordered_func2 = transform.iree.reorder_transpose %reordered_func : (!pdl.operation) -> !pdl.operation
+    transform.iree.apply_patterns %reordered_func2 { cse } : (!pdl.operation) -> ()
+    %func_x = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
+    transform.iree.apply_patterns %func_x {  prepare_vector_to_mma } : (!pdl.operation) -> ()
+    %func_11 = transform.iree.layout_analysis_and_distribution %reordered_func2 : (!pdl.operation) -> (!pdl.operation)
 }
