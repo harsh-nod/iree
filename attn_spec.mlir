@@ -14,9 +14,9 @@ transform.sequence failures(propagate) {
     // Tile and decompose attention
     // ==========================================
     %attention2 = transform.structured.match ops{["iree_linalg_ext.attention"]} in %variant_op : (!pdl.operation) -> !pdl.operation
-    %outer_loop, %max_fill, %sum_fill, %mid_loop, %inner_loop, %fill_op, %first_matmul, %reduce_max, %partial_softmax, %reduce_sum, %update,
+    %outer_loop, %mid_loop, %inner_loop, %fill_op, %first_matmul, %reduce_max, %partial_softmax, %reduce_sum, %update,
     %softmax, %scale_acc, %second_matmul = tile_and_decompose_attention %attention2 :
-       (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation)
+       (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation)
 
     // Vectorize function
     // ==========================================
@@ -60,6 +60,6 @@ transform.sequence failures(propagate) {
     %reordered_func2 = transform.iree.reorder_transpose %reordered_func : (!pdl.operation) -> !pdl.operation
     transform.iree.apply_patterns %reordered_func2 { cse } : (!pdl.operation) -> ()
     %func_x = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
-    transform.iree.apply_patterns %func_x {  prepare_vector_to_mma } : (!pdl.operation) -> ()
+    transform.iree.apply_patterns %func_x {  prepare_vector_to_mma, cse } : (!pdl.operation) -> ()
     %func_11 = transform.iree.layout_analysis_and_distribution %reordered_func2 : (!pdl.operation) -> (!pdl.operation)
 }

@@ -412,17 +412,15 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   query = ret.value();
 
   Value output = attnOp.getOutput();
+  auto shape = output.getType().cast<ShapedType>().getShape();
+  auto outputF32Type = RankedTensorType::get(shape, rewriter.getF32Type());
+  output = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(outputF32Type));
   ret = bufferization::allocateTensorForShapedValue(
                 rewriter, loc, output, false, options, true);
   if (failed(ret)) {
     return {};
   }
   output = ret.value();
-
-  // Extend output to f32
-  ArrayRef<int64_t> outputShape = output.getType().cast<ShapedType>().getShape();
-  Value scratch = rewriter.create<tensor::EmptyOp>(loc, outputShape, rewriter.getF32Type());
-  output = extendToF32(output, scratch, rewriter, loc);
 
   // Construct first loop
   Value zeroValue = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -439,21 +437,22 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   rewriter.setInsertionPointToStart(firstLoopNest.loops.back().getBody());
 
   // Create max and sum statistics
-  Type statType = rewriter.getF32Type();
-  Value zeroF32 = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getZeroAttr(statType));
-  Value largeNegativeF32 = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getFloatAttr(statType, -1.0e+30));
   SmallVector<OpFoldResult> dims{sequenceTileLength};
-  Value max = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
-  auto maxFill =
-      rewriter.create<linalg::FillOp>(loc, ValueRange{largeNegativeF32}, max);
-  Value negativeMax = maxFill.result();
-  ops.push_back(maxFill);
-  Value sum = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
-  auto sumFill = rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, sum);
-  Value zeroSum = sumFill.result();
-  ops.push_back(sumFill);
+  Type statType = rewriter.getF32Type();
+  RankedTensorType statTensorType = RankedTensorType::get(ArrayRef<int64_t>{queryShape[1]}, statType);
+  Value zeroSum = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getZeroAttr(statTensorType));
+  Value negativeMax = rewriter.create<arith::ConstantOp>(loc,
+      statTensorType, DenseElementsAttr::get(statTensorType, FloatAttr::get(statType, -1.0e+30)));
+  //Value max = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
+  //auto maxFill =
+  //    rewriter.create<linalg::FillOp>(loc, ValueRange{largeNegativeF32}, max);
+  //Value negativeMax = maxFill.result();
+  //ops.push_back(maxFill);
+  //Value sum = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
+  //auto sumFill = rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, sum);
+  //Value zeroSum = sumFill.result();
+  //ops.push_back(sumFill);
 
   // Construct second loop
   scf::LoopNest secondLoopNest = createLoopNest(
@@ -560,9 +559,10 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   OpBuilder::InsertionGuard forGuard(rewriter);
   rewriter.setInsertionPointAfter(firstLoopNest.loops[0]);
   ArrayRef<int64_t> resultShape = firstLoopNest.results[0].getType().cast<ShapedType>().getShape();
-  scratch = rewriter.create<tensor::EmptyOp>(loc, resultShape, rewriter.getF16Type());
+  Value scratch = rewriter.create<tensor::EmptyOp>(loc, resultShape, rewriter.getF16Type());
   result = truncateToF16<3>(firstLoopNest.results[0], scratch, rewriter, loc);
 
+  //attnOp->getParentOfType<ModuleOp>().dump();
   attnOp.getResults()[0].replaceAllUsesWith(result);
   return ops;
 }
