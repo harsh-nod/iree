@@ -43,7 +43,7 @@ transform.sequence failures(propagate) {
     // ===========================================================================
     %func_7 = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
     transform.iree.forall_to_workgroup %func_7 : (!pdl.operation) -> ()
-    transform.iree.map_nested_forall_to_gpu_threads %func_7 workgroup_dims = [4, 8, 2] warp_dims = [2, 1, 1] : (!pdl.operation) -> ()
+    transform.iree.map_nested_forall_to_gpu_threads %func_7 workgroup_dims = [4, 8, 4] warp_dims = [4, 1, 1] : (!pdl.operation) -> ()
 
     %func_8 = transform.structured.hoist_redundant_vector_transfers %memref_func
     : (!pdl.operation) -> !pdl.operation
@@ -61,5 +61,7 @@ transform.sequence failures(propagate) {
     transform.iree.apply_patterns %reordered_func2 { cse } : (!pdl.operation) -> ()
     %func_x = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
     transform.iree.apply_patterns %func_x {  prepare_vector_to_mma, cse } : (!pdl.operation) -> ()
-    %func_11 = transform.iree.layout_analysis_and_distribution %reordered_func2 : (!pdl.operation) -> (!pdl.operation)
+    %func_y = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
+    %preproc_func = transform.iree.eliminate_shmem_trip %func_y : (!pdl.operation) -> !pdl.operation
+    %func_11 = transform.iree.layout_analysis_and_distribution %preproc_func : (!pdl.operation) -> (!pdl.operation)
 }

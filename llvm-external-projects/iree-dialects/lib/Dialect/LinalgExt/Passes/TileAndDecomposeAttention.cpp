@@ -411,15 +411,22 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   query = ret.value();
 
   Value output = attnOp.getOutput();
-  auto shape = output.getType().cast<ShapedType>().getShape();
-  auto outputF32Type = RankedTensorType::get(shape, rewriter.getF32Type());
-  output = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(outputF32Type));
   ret = bufferization::allocateTensorForShapedValue(
                 rewriter, loc, output, false, options, true);
   if (failed(ret)) {
     return {};
   }
   output = ret.value();
+
+  auto shape = output.getType().cast<ShapedType>().getShape();
+  auto outputF32Type = RankedTensorType::get(shape, rewriter.getF32Type());
+  Value outputF32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(outputF32Type));
+  ret = bufferization::allocateTensorForShapedValue(
+                rewriter, loc, outputF32, false, options, true);
+  if (failed(ret)) {
+    return {};
+  }
+  outputF32 = ret.value();
 
   // Construct first loop
   Value zeroValue = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -428,7 +435,7 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   scf::LoopNest firstLoopNest = createLoopNest(
       ivs, zeroValue, oneValue,
       getValueOrCreateConstantIndexOp(rewriter, loc, batchTileLength),
-      ValueRange({output}), loc, rewriter);
+      ValueRange({outputF32}), loc, rewriter);
   Value iterArg = firstLoopNest.loops.back().getRegionIterArg(0);
   ops.push_back(firstLoopNest.loops.back());
 
@@ -488,10 +495,10 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   valueSlice = ret.value();
 
   // Construct third loop
-  int64_t tileSize{16};
+  int64_t tileSize{32};
   OpFoldResult warpSize = rewriter.getIndexAttr(tileSize);
   // Number of warps to distribute on
-  OpFoldResult numWarps = rewriter.getIndexAttr(2);
+  OpFoldResult numWarps = rewriter.getIndexAttr(4);
   SmallVector<Attribute> warpMapping{mlir::gpu::GPUWarpMappingAttr::get(rewriter.getContext(), mlir::gpu::Warps::DimX)};
   scf::ForallOp forallOp = rewriter.create<scf::ForallOp>(
       loc, numWarps, ValueRange({iterArgResult, iterArgMax, iterArgSum}),
@@ -557,9 +564,9 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
 
   OpBuilder::InsertionGuard forGuard(rewriter);
   rewriter.setInsertionPointAfter(firstLoopNest.loops[0]);
-  ArrayRef<int64_t> resultShape = firstLoopNest.results[0].getType().cast<ShapedType>().getShape();
-  Value scratch = rewriter.create<tensor::EmptyOp>(loc, resultShape, rewriter.getF16Type());
-  result = truncateToF16<3>(firstLoopNest.results[0], scratch, rewriter, loc);
+  //ArrayRef<int64_t> resultShape = firstLoopNest.results[0].getType().cast<ShapedType>().getShape();
+  //Value scratch = rewriter.create<tensor::EmptyOp>(loc, resultShape, rewriter.getF16Type());
+  result = truncateToF16<3>(firstLoopNest.results[0], output, rewriter, loc);
 
   //attnOp->getParentOfType<ModuleOp>().dump();
   attnOp.getResults()[0].replaceAllUsesWith(result);

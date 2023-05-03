@@ -558,4 +558,32 @@ def ReorderTransposeOp :
 
 }
 
+def EliminateShmemTripOp :
+  Op<Transform_Dialect, "iree.eliminate_shmem_trip",
+    [FunctionalStyleTransformOpTrait,
+     MemoryEffectsOpInterface,
+     TransformEachOpTrait,
+     TransformOpInterface]> {
+  let description = [{
+  }];
+
+  let arguments = (ins PDL_Operation:$target);
+  let results = (outs Variadic<PDL_Operation>:$result);
+
+  let assemblyFormat = [{ $target attr-dict `:` functional-type(operands, results)}];
+  let cppNamespace = "mlir::iree_compiler::IREE::transform_dialect";
+
+  let builders = [
+    OpBuilder<(ins "Value":$target)>
+  ];
+
+  let extraClassDeclaration = [{
+    ::mlir::DiagnosedSilenceableFailure applyToOne(
+        ::mlir::func::FuncOp target,
+        ::mlir::transform::ApplyToEachResultList &results,
+        ::mlir::transform::TransformState &state);
+  }];
+
+}
+
 #endif // IREE_COMPILER_CODEGEN_LLVMGPU_TRANSFORMEXTENSIONS_LLVMGPUEXTENSIONS

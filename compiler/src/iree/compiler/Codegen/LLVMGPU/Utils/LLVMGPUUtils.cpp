@@ -294,5 +294,74 @@ void reorderTranspose(IRRewriter& rewriter, func::FuncOp funcOp) {
   }
 }
 
+void eliminateTripToSharedMemory(IRRewriter &rewriter, func::FuncOp funcOp) {
+  SmallVector<vector::TransferWriteOp> writeOps;
+  SmallVector<std::tuple<vector::TransferWriteOp, vector::TransferReadOp>> readWritePairs;
+  funcOp.walk([&](Operation* op) {
+    if (auto writeOp = dyn_cast<vector::TransferWriteOp>(op)) {
+      // Check if write is to shared memory
+      Value source = writeOp.getSource();
+      MemRefType sourceType = source.getType().cast<MemRefType>();
+      Attribute memorySpace = sourceType.getMemorySpace();
+      if (!memorySpace) return WalkResult::advance();
+      if (auto gpuAttr = memorySpace.dyn_cast<gpu::AddressSpaceAttr>()) {
+        if (gpuAttr.getValue() == gpu::AddressSpace::Workgroup) {
+          writeOps.push_back(writeOp);
+        }
+      }
+    }
+    if (auto readOp = dyn_cast<vector::TransferReadOp>(op)) {
+      Value source = readOp.getSource();
+      for (vector::TransferWriteOp writeOp : writeOps) {
+        Value writeSource = writeOp.getSource();
+        // Don't check indices for now
+        if (source == writeSource) {
+          readWritePairs.push_back(std::make_tuple(writeOp, readOp));
+        }
+      }
+    }
+    return WalkResult::advance();
+  });
+
+  SmallVector<Operation *> toErase;
+  for (auto [writeOp, readOp] : readWritePairs) {
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPoint(writeOp);
+    Value src = writeOp.getVector();
+    for (Operation *op : readOp.getVector().getUsers()) {
+      if (OpTrait::hasElementwiseMappableTraits(op)) {
+        VectorType srcType = src.getType().cast<VectorType>();
+        VectorType resType = op->getResult(0).getType().cast<VectorType>();
+        Type resultType = VectorType::get(srcType.getShape(), resType.getElementType());
+        Operation* newOp =
+            rewriter.create(op->getLoc(), op->getName().getIdentifier(),
+                            src, resultType, op->getAttrs());
+        Value newSrc;
+        Operation *secondWrite;
+        for (Operation *user : op->getResult(0).getUsers()) {
+          if (auto newWriteOp = dyn_cast<vector::TransferWriteOp>(user)) {
+            newSrc = newWriteOp.getSource();
+            secondWrite = newWriteOp;
+          }
+        }
+        if (!newSrc) return;
+        rewriter.create<vector::TransferWriteOp>(op->getLoc(), newOp->getResult(0),
+                                                 newSrc, writeOp.getIndices(), writeOp.getPermutationMapAttr(),
+                                                 writeOp.getInBoundsAttr());
+        toErase.push_back(secondWrite);
+        toErase.push_back(op);
+        toErase.push_back(readOp);
+        toErase.push_back(writeOp);
+        break;
+      }
+    }
+  }
+
+  for (Operation *op : toErase) {
+    rewriter.eraseOp(op);
+  }
+
+}
+
 }  // namespace iree_compiler
 }  // namespace mlir
