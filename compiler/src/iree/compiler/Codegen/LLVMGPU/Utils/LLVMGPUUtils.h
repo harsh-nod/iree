@@ -24,6 +24,8 @@ void doLayoutAnalysisAndDistribution(IRRewriter &rewriter, func::FuncOp funcOp);
 /// Function to reorder transposes and elementwise ops.
 void reorderTranspose(IRRewriter &rewriter, func::FuncOp funcOp);
 
+void eliminateTripToSharedMemory(IRRewriter &rewriter, func::FuncOp funcOp);
+
 }  // namespace iree_compiler
 }  // namespace mlir
 
