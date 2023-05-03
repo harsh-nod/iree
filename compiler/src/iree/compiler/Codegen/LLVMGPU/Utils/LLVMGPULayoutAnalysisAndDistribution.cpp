@@ -1239,6 +1239,8 @@ static void distributeReductionBroadcastTranspose(
 
       if (bitWidth > 16)
         vector = newVector;
+      else
+        vector = slice;
 
       // Since this is a broadcasted tensor, we only need to extract the 0th
       // element
