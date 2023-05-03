@@ -1200,21 +1200,45 @@ static void distributeReductionBroadcastTranspose(
           loc, vector,
           SmallVector<int64_t>{state[DimType::Batch0], state[DimType::Batch1],
                                vectorOffset});
-      ArrayRef<int64_t> vShape = vector.getType().cast<VectorType>().getShape();
+      VectorType vType = vector.getType().cast<VectorType>();
+      ArrayRef<int64_t> vShape = vType.getShape();
       assert(vShape.size() == 1);
+      Type elementType = vType.getElementType();
+      int bitWidth = elementType.getIntOrFloatBitWidth();
 
+      Value newVector = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(vector.getType()));
+      Value slice = vector;
       uint32_t size{32};
       Value mask;
-      for (uint64_t i = offset; i < offset * layout.shape[dimType]; i <<= 1) {
-        Value packed = packVectorToSupportedWidth(loc, rewriter, vector);
-        auto shuffleOp = rewriter.create<gpu::ShuffleOp>(loc, packed, i, size,
-                                                         gpu::ShuffleMode::XOR);
-        Value unpacked =
-            unpackToVector(loc, rewriter, shuffleOp.getShuffleResult(),
-                           vector.getType().cast<VectorType>());
-        vector = makeArithReduction(rewriter, loc, combiningKind, unpacked,
-                                    vector, mask);
+      for (int n = 0; n < bitWidth / 16; n++) {
+
+        if (bitWidth > 16) {
+          SmallVector<int64_t> offset{n};
+          SmallVector<int64_t> one{1};
+          slice = rewriter.create<vector::ExtractStridedSliceOp>(loc, vector, offset, one, one);
+        }
+
+        for (uint64_t i = offset; i < offset * layout.shape[dimType]; i <<= 1) {
+          Value packed = packVectorToSupportedWidth(loc, rewriter, slice);
+          auto shuffleOp = rewriter.create<gpu::ShuffleOp>(loc, packed, i, size,
+                                                           gpu::ShuffleMode::XOR);
+          Value unpacked =
+              unpackToVector(loc, rewriter, shuffleOp.getShuffleResult(),
+                             slice.getType().cast<VectorType>());
+          slice = makeArithReduction(rewriter, loc, combiningKind, unpacked,
+                                      slice, mask);
+        }
+
+        if (bitWidth > 16) {
+          SmallVector<int64_t> offset{n};
+          SmallVector<int64_t> one{1};
+          newVector = rewriter.create<vector::InsertStridedSliceOp>(loc, slice, newVector, offset, one);
+        }
+
       }
+
+      if (bitWidth > 16)
+        vector = newVector;
 
       // Since this is a broadcasted tensor, we only need to extract the 0th
       // element
