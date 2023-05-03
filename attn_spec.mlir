@@ -8,7 +8,7 @@ transform.sequence failures(propagate) {
     // Tile and distribute to workgroups
     // ==========================================
     %forall_grid, %tiled_attention =
-    transform.iree.tile_to_forall_and_workgroup_count_region %attention tile_sizes [1, 256]
+    transform.iree.tile_to_forall_and_workgroup_count_region %attention tile_sizes [1, 128]
       ( mapping = [#gpu.block<x>, #gpu.block<y>] )
 
     // Tile and decompose attention
@@ -43,7 +43,7 @@ transform.sequence failures(propagate) {
     // ===========================================================================
     %func_7 = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
     transform.iree.forall_to_workgroup %func_7 : (!pdl.operation) -> ()
-    transform.iree.map_nested_forall_to_gpu_threads %func_7 workgroup_dims = [4, 8, 2] warp_dims = [2, 1, 1] : (!pdl.operation) -> ()
+    transform.iree.map_nested_forall_to_gpu_threads %func_7 workgroup_dims = [4, 8, 4] warp_dims = [4, 1, 1] : (!pdl.operation) -> ()
 
     %func_8 = transform.structured.hoist_redundant_vector_transfers %memref_func
     : (!pdl.operation) -> !pdl.operation
