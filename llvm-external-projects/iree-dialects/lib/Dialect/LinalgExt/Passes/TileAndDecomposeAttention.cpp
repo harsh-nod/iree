@@ -419,8 +419,12 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   output = ret.value();
 
   auto shape = output.getType().cast<ShapedType>().getShape();
-  auto outputF32Type = RankedTensorType::get(shape, rewriter.getF32Type());
-  Value outputF32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(outputF32Type));
+  Type statType = rewriter.getF32Type();
+  Value zeroF32 = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getZeroAttr(statType));
+  Value emptyOutputF32 = rewriter.create<tensor::EmptyOp>(loc, shape, rewriter.getF32Type());
+  auto outputF32 =
+      rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, emptyOutputF32).result();
   ret = bufferization::allocateTensorForShapedValue(
                 rewriter, loc, outputF32, false, options, true);
   if (failed(ret)) {
@@ -444,21 +448,15 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
 
   // Create max and sum statistics
   SmallVector<OpFoldResult> dims{sequenceTileLength};
-  Type statType = rewriter.getF32Type();
-  RankedTensorType statTensorType = RankedTensorType::get(ArrayRef<int64_t>{queryShape[1]}, statType);
-  Value zeroSum = rewriter.create<arith::ConstantOp>(
-      loc, rewriter.getZeroAttr(statTensorType));
-  Value negativeMax = rewriter.create<arith::ConstantOp>(loc,
-      statTensorType, DenseElementsAttr::get(statTensorType, FloatAttr::get(statType, -1.0e+30)));
-  //Value max = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
-  //auto maxFill =
-  //    rewriter.create<linalg::FillOp>(loc, ValueRange{largeNegativeF32}, max);
-  //Value negativeMax = maxFill.result();
-  //ops.push_back(maxFill);
-  //Value sum = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
-  //auto sumFill = rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, sum);
-  //Value zeroSum = sumFill.result();
-  //ops.push_back(sumFill);
+  Value largeNegativeF32 = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getFloatAttr(statType, -1.0e+30));
+  Value max = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
+  auto maxFill =
+      rewriter.create<linalg::FillOp>(loc, ValueRange{largeNegativeF32}, max);
+  Value negativeMax = maxFill.result();
+  Value sum = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
+  auto sumFill = rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, sum);
+  Value zeroSum = sumFill.result();
 
   // Construct second loop
   scf::LoopNest secondLoopNest = createLoopNest(
