@@ -1358,8 +1358,11 @@ static void distributeReductionBroadcastTranspose(
     // Broadcast result to same shape as original
     iterate(0, reductionOrder, state, layout, broadcastResult);
 
-    // Reset state
-    state.fill(0);
+    // Reset reduction state
+    for (int type : reductionOrder) {
+      state[type] = 0;
+    }
+
   };
 
   std::array<int, DimType::NumDims> state;
