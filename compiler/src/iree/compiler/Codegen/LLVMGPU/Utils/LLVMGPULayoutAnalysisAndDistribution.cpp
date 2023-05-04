@@ -349,9 +349,12 @@ static void propagateLayoutToReduceBroadcastTranspose(
   layoutMap.at(transposedResult).debugPrint("transposed");
   // Propagate 2D layout to 1D accumulator
   Value acc = reductionOp.getAcc();
-  if (layoutMap.count(acc)) return;
-  layoutMap.try_emplace(acc, newLayout);
-  layoutMap.at(acc).debugPrint("accumulator");
+  if (!layoutMap.count(acc)) {
+    layoutMap.try_emplace(acc, newLayout);
+    layoutMap.at(acc).debugPrint("accumulator");
+  }
+  layoutMap.try_emplace(reductionOp.getResult(), newLayout);
+  layoutMap.at(acc).debugPrint("reduction result");
 }
 
 static std::vector<std::tuple<vector::BroadcastOp, vector::TransposeOp>>
@@ -369,6 +372,23 @@ checkForReduceBroadcastTranspose(vector::MultiDimReductionOp reductionOp) {
       }
       broadcastOp = broadcast;
       pairs.push_back(std::make_tuple(broadcastOp, transposeOp));
+    }
+  }
+  // Check for RBTs with one elementwise op in between reduction and broadcast
+  for (Operation *user : reductionOp.getResult().getUsers()) {
+    if (OpTrait::hasElementwiseMappableTraits(user)) {
+      for (Operation *eUser : user->getResult(0).getUsers()) {
+        if (auto broadcast = dyn_cast<vector::BroadcastOp>(eUser)) {
+          for (Operation *bUser : broadcast.getResult().getUsers()) {
+            if (auto transpose = dyn_cast<vector::TransposeOp>(bUser)) {
+              transposeOp = transpose;
+              break;
+            }
+          }
+          broadcastOp = broadcast;
+          pairs.push_back(std::make_tuple(broadcastOp, transposeOp));
+        }
+      }
     }
   }
   return pairs;
@@ -472,6 +492,7 @@ static void propagateLayoutToInnerBroadcast(vector::BroadcastOp broadcastOp,
                                             DenseMap<Value, Layout> &layoutMap) {
   Value src = broadcastOp.getSource();
   if (!layoutMap.count(src)) return;
+  if (layoutMap.count(transposeOp.getResult())) return;
   ArrayRef<int64_t> resultShape = transposeOp.getResult().getType().cast<ShapedType>().getShape();
   Layout layout = layoutMap.at(src);
   if (layout.order.size() != resultShape.size()) return;
@@ -1149,6 +1170,52 @@ static void iterate(int dimType, ArrayRef<int> order,
   }
 }
 
+static void distributeElementwise(Operation *op,
+                                  DenseMap<Value, Layout> &layoutMap,
+                                  DenseMap<Value, Value> &simdToSimtMap,
+                                  OpBuilder &rewriter,
+                                  llvm::SetVector<Operation *> &ops,
+                                  DenseMap<Value, Layout> &layoutConflicts) {
+  if (!OpTrait::hasElementwiseMappableTraits(op)) return;
+  if (op->getNumResults() != 1) return;
+  if (simdToSimtMap.count(op->getResult(0))) return;
+  // Passthrough ext ops of contract operands
+  if (auto extOp = dyn_cast<arith::ExtFOp>(op)) {
+    for (Operation *user : extOp.getResult().getUsers()) {
+      if (auto contractOp = dyn_cast<vector::ContractionOp>(user)) {
+        if (!simdToSimtMap.count(extOp.getOperand())) return;
+        simdToSimtMap.try_emplace(extOp.getResult(), simdToSimtMap.at(extOp.getOperand()));
+        ops.insert(op);
+        return;
+      }
+    }
+  }
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPoint(op);
+  SmallVector<Value> newOperands;
+  Location loc = op->getLoc();
+  for (auto operand : op->getOperands()) {
+    if (!simdToSimtMap.count(operand)) return;
+    newOperands.push_back(simdToSimtMap.at(operand));
+  }
+  VectorType simdResultType = op->getResult(0).getType().cast<VectorType>();
+  VectorType simtOperandType = newOperands.front().getType().cast<VectorType>();
+  VectorType simtResultType = simtOperandType;
+  if (simdResultType.getElementType() != simtOperandType.getElementType()) {
+    simtResultType = VectorType::get(simtOperandType.getShape(), simdResultType.getElementType());
+  }
+  SmallVector<Type> resultTypes{simtResultType};
+  Operation *newOp =
+      rewriter.create(op->getLoc(), op->getName().getIdentifier(), newOperands,
+                      resultTypes, op->getAttrs());
+  Value result = op->getResult(0);
+  simdToSimtMap.try_emplace(result, newOp->getResult(0));
+  if (!resolveLayoutConficts(result, layoutMap, layoutConflicts, simdToSimtMap,
+                             loc, rewriter)) return;
+  ops.insert(op);
+}
+
+
 static void distributeReductionBroadcastTranspose(
     vector::MultiDimReductionOp reductionOp, vector::BroadcastOp broadcastOp,
     vector::TransposeOp transposeOp, DenseMap<Value, Layout> &layoutMap,
@@ -1297,9 +1364,18 @@ static void distributeReductionBroadcastTranspose(
   state.fill(0);
   iterate(0, parallelOrder, state, layout, loopBody);
 
-  simdToSimtMap.try_emplace(transposeOp.getResult(), output);
   simdToSimtMap.try_emplace(reductionOp.getResult(), output);
+
+  // Handle the case when we have an elementwise op between the reduction and broadcast
   ops.insert(reductionOp);
+  Operation *parentOp = broadcastOp.getSource().getDefiningOp();
+  if (OpTrait::hasElementwiseMappableTraits(parentOp)) {
+    distributeElementwise(parentOp, layoutMap, simdToSimtMap, rewriter, ops, layoutConflicts);
+    simdToSimtMap.try_emplace(transposeOp.getResult(), simdToSimtMap.at(parentOp->getResult(0)));
+  } else {
+    simdToSimtMap.try_emplace(transposeOp.getResult(), output);
+  }
+
   ops.insert(broadcastOp);
   ops.insert(transposeOp);
 }
@@ -1431,50 +1507,6 @@ static void distributeConstants(arith::ConstantOp constantOp,
   simdToSimtMap.try_emplace(constant, result);
 }
 
-static void distributeElementwise(Operation *op,
-                                  DenseMap<Value, Layout> &layoutMap,
-                                  DenseMap<Value, Value> &simdToSimtMap,
-                                  IRRewriter &rewriter,
-                                  llvm::SetVector<Operation *> &ops,
-                                  DenseMap<Value, Layout> &layoutConflicts) {
-  if (!OpTrait::hasElementwiseMappableTraits(op)) return;
-  if (op->getNumResults() != 1) return;
-  // Passthrough ext ops of contract operands
-  if (auto extOp = dyn_cast<arith::ExtFOp>(op)) {
-    for (Operation *user : extOp.getResult().getUsers()) {
-      if (auto contractOp = dyn_cast<vector::ContractionOp>(user)) {
-        if (!simdToSimtMap.count(extOp.getOperand())) return;
-        simdToSimtMap.try_emplace(extOp.getResult(), simdToSimtMap.at(extOp.getOperand()));
-        ops.insert(op);
-        return;
-      }
-    }
-  }
-  OpBuilder::InsertionGuard g(rewriter);
-  rewriter.setInsertionPoint(op);
-  SmallVector<Value> newOperands;
-  Location loc = op->getLoc();
-  for (auto operand : op->getOperands()) {
-    if (!simdToSimtMap.count(operand)) return;
-    newOperands.push_back(simdToSimtMap.at(operand));
-  }
-  VectorType simdResultType = op->getResult(0).getType().cast<VectorType>();
-  VectorType simtOperandType = newOperands.front().getType().cast<VectorType>();
-  VectorType simtResultType = simtOperandType;
-  if (simdResultType.getElementType() != simtOperandType.getElementType()) {
-    simtResultType = VectorType::get(simtOperandType.getShape(), simdResultType.getElementType());
-  }
-  SmallVector<Type> resultTypes{simtResultType};
-  Operation *newOp =
-      rewriter.create(op->getLoc(), op->getName().getIdentifier(), newOperands,
-                      resultTypes, op->getAttrs());
-  Value result = op->getResult(0);
-  simdToSimtMap.try_emplace(result, newOp->getResult(0));
-  if (!resolveLayoutConficts(result, layoutMap, layoutConflicts, simdToSimtMap,
-                             loc, rewriter)) return;
-  ops.insert(op);
-}
-
 static void distributeInnerBroadcast(vector::BroadcastOp broadcastOp, vector::TransposeOp transposeOp,
                                      DenseMap<Value, Layout> &layoutMap,
                                      DenseMap<Value, Value> &simdToSimtMap,
@@ -1482,6 +1514,7 @@ static void distributeInnerBroadcast(vector::BroadcastOp broadcastOp, vector::Tr
                                      llvm::SetVector<Operation *> &ops) {
   Value src = broadcastOp.getSource();
   if (!simdToSimtMap.count(src)) return;
+  if (simdToSimtMap.count(transposeOp.getResult())) return;
   simdToSimtMap.try_emplace(transposeOp.getResult(), simdToSimtMap.at(src));
   ops.insert(transposeOp);
 }
