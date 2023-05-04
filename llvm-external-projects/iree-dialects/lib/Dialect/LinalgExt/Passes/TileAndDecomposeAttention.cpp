@@ -97,7 +97,7 @@ static Value updateAndScale(Value oldMax, Value newMax, Value oldSum,
   return genericOp.getResult(0);
 }
 
-static Value scalePartialSoftmax(Value softmax, Value newSum, Location loc,
+static Value scalePartialSoftmax(Value softmax, Value inverseNewSum, Location loc,
                                  OpBuilder &builder,
                                  SmallVectorImpl<Operation *> &ops) {
   AffineMap identityMap =
@@ -110,9 +110,33 @@ static Value scalePartialSoftmax(Value softmax, Value newSum, Location loc,
   SmallVector<utils::IteratorType> iteratorTypes(2,
                                                  utils::IteratorType::parallel);
   auto genericOp = builder.create<linalg::GenericOp>(
-      loc, softmax.getType(), ValueRange{newSum}, softmax, indexingMaps,
+      loc, softmax.getType(), ValueRange{inverseNewSum}, softmax, indexingMaps,
       iteratorTypes, [&](OpBuilder &b, Location loc, ValueRange args) {
-        Value result = b.create<arith::DivFOp>(loc, args[1], args[0]);
+        Value result = b.create<arith::MulFOp>(loc, args[1], args[0]);
+        b.create<linalg::YieldOp>(loc, result);
+      });
+  ops.push_back(genericOp);
+  return genericOp.getResult(0);
+}
+
+static Value computeReciprocal(Value x, Location loc,
+                              OpBuilder &builder,
+                              SmallVectorImpl<Operation *> &ops) {
+  AffineMap identityMap =
+      AffineMap::getMultiDimIdentityMap(1, builder.getContext());
+  AffineExpr d0;
+  bindDims(builder.getContext(), d0);
+  // (d0, d1) -> (d0)
+  auto rowMap = AffineMap::get(1, 0, {d0}, builder.getContext());
+  SmallVector<AffineMap> indexingMaps{identityMap, identityMap};
+  SmallVector<utils::IteratorType> iteratorTypes(2,
+                                                 utils::IteratorType::parallel);
+  auto genericOp = builder.create<linalg::GenericOp>(
+      loc, x.getType(), ValueRange{x},
+      x, indexingMaps, iteratorTypes,
+      [&](OpBuilder &b, Location loc, ValueRange args) {
+        Value one = b.create<arith::ConstantOp>(loc, b.getFloatAttr(args[0].getType(), 1.0));
+        Value result = b.create<arith::DivFOp>(loc, one, args[0]);
         b.create<linalg::YieldOp>(loc, result);
       });
   ops.push_back(genericOp);
@@ -120,7 +144,7 @@ static Value scalePartialSoftmax(Value softmax, Value newSum, Location loc,
 }
 
 static Value scaleAccumulator(Value accumulator, Value scaledOldSum,
-                              Value newSum, Value output, Location loc,
+                              Value inverseNewSum, Value output, Location loc,
                               OpBuilder &builder,
                               SmallVectorImpl<Operation *> &ops) {
   AffineMap identityMap =
@@ -133,10 +157,10 @@ static Value scaleAccumulator(Value accumulator, Value scaledOldSum,
   SmallVector<utils::IteratorType> iteratorTypes(2,
                                                  utils::IteratorType::parallel);
   auto genericOp = builder.create<linalg::GenericOp>(
-      loc, output.getType(), ValueRange{accumulator, scaledOldSum, newSum},
+      loc, output.getType(), ValueRange{accumulator, scaledOldSum, inverseNewSum},
       output, indexingMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
-        Value ratio = b.create<arith::DivFOp>(loc, args[1], args[2]);
+        Value ratio = b.create<arith::MulFOp>(loc, args[1], args[2]);
         Value result = b.create<arith::MulFOp>(loc, ratio, args[0]);
         b.create<linalg::YieldOp>(loc, result);
       });
@@ -355,8 +379,9 @@ createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
       updateAndScale(maxSlice, newMax, sumSlice, loc, builder, ops);
   Value newSum = computeRowwiseReduction<arith::AddFOp>(
       partialSoftmax, scaledOldSum, loc, builder, ops);
+  Value inverseNewSum = computeReciprocal(newSum, loc, builder, ops);
   Value softmax =
-      scalePartialSoftmax(partialSoftmax, newSum, loc, builder, ops);
+      scalePartialSoftmax(partialSoftmax, inverseNewSum, loc, builder, ops);
 
   ArrayRef<int64_t> softmaxShape = softmax.getType().cast<ShapedType>().getShape();
   Value scratch = builder.create<tensor::EmptyOp>(loc, resultShape, builder.getF16Type());
@@ -366,7 +391,7 @@ createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
   Value empty = builder.create<tensor::EmptyOp>(
       loc, SmallVector<OpFoldResult>{tileSize, headDimension},
       f32Type);
-  Value scaledAcc = scaleAccumulator(outputSlice, scaledOldSum, newSum, empty,
+  Value scaledAcc = scaleAccumulator(outputSlice, scaledOldSum, inverseNewSum, empty,
                                      loc, builder, ops);
 
   // Compute matmul(softmax, v)
