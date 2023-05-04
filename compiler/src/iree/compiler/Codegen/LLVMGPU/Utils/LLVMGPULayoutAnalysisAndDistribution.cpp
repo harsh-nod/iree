@@ -1265,84 +1265,83 @@ static void distributeReductionBroadcastTranspose(
   }
 
   bodyType loopBody = [&](std::array<int, DimType::NumDims> &state) {
-    Value result;
+    Value vector = simdToSimtMap.at(source);
+    VectorType vType = vector.getType().cast<VectorType>();
+    Type elementType = vType.getElementType();
+    int bitWidth = elementType.getIntOrFloatBitWidth();
+    uint32_t size{32};
+    Value mask;
 
-    auto reduce = [&](std::array<int, DimType::NumDims> &state) {
-      Value vector = simdToSimtMap.at(source);
-      int vectorOffset =
-          state[DimType::VecIdY] * layout.shape[DimType::VecIdZ] +
-          state[DimType::VecIdZ];
-      if (std::find(reductionOrder.begin(), reductionOrder.end(),
-                    DimType::VecIdX) == reductionOrder.end()) {
-        vector = rewriter.create<vector::TransposeOp>(
-            loc, vector, ArrayRef<int64_t>{0, 1, 3, 2});
-        vectorOffset = state[DimType::VecIdX];
-      }
-
-      vector = rewriter.create<vector::ExtractOp>(
-          loc, vector,
+    Value accValue = rewriter.create<vector::ExtractOp>(
+          loc, simdToSimtMap.at(acc),
           SmallVector<int64_t>{state[DimType::Batch0], state[DimType::Batch1],
-                               vectorOffset});
-      VectorType vType = vector.getType().cast<VectorType>();
-      ArrayRef<int64_t> vShape = vType.getShape();
-      assert(vShape.size() == 1);
+            state[DimType::VecIdY] * layout.shape[DimType::VecIdZ] + state[DimType::VecIdZ],
+            state[DimType::VecIdX]});
 
-      Type elementType = vType.getElementType();
-      int bitWidth = elementType.getIntOrFloatBitWidth();
+    Value tmp, result;
+    int count{0};
+    if (bitWidth == 32) {
+      tmp = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(VectorType::get({1}, elementType)));
+      result = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(VectorType::get({1}, elementType)));
+      result = rewriter.create<vector::InsertOp>(loc, accValue, result, SmallVector<int64_t>{0});
+    } else {
+      tmp = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(VectorType::get({2}, elementType)));
+      result = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(VectorType::get({2}, elementType)));
+      result = rewriter.create<vector::InsertOp>(loc, accValue, result, SmallVector<int64_t>{0});
+      result = rewriter.create<vector::InsertOp>(loc, accValue, result, SmallVector<int64_t>{1});
+    }
 
-      uint32_t size{32};
-      Value mask;
+    // Returns vector<1xf32> or vector<2xf16>
+    auto reduceLocal = [&](std::array<int, DimType::NumDims> &state) {
+      Value x = rewriter.create<vector::ExtractOp>(
+          loc, vector,
+          SmallVector<int64_t>{
+              state[DimType::Batch0], state[DimType::Batch1],
+              state[DimType::VecIdY] * layout.shape[DimType::VecIdZ] + state[DimType::VecIdZ],
+              state[DimType::VecIdX]});
 
-      Value newVector = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(vector.getType()));
-      Value slice = vector;
-      for (int n = 0; n < bitWidth / 16; n++) {
-
-        if (bitWidth > 16) {
-          SmallVector<int64_t> offset{n};
-          SmallVector<int64_t> one{1};
-          slice = rewriter.create<vector::ExtractStridedSliceOp>(loc, vector, offset, one, one);
-        }
-
-        for (uint64_t i = offset; i < offset * layout.shape[dimType]; i <<= 1) {
-          Value packed = packVectorToSupportedWidth(loc, rewriter, slice);
-          auto shuffleOp = rewriter.create<gpu::ShuffleOp>(loc, packed, i, size,
-                                                           gpu::ShuffleMode::XOR);
-          Value unpacked =
-              unpackToVector(loc, rewriter, shuffleOp.getShuffleResult(),
-                             slice.getType().cast<VectorType>());
-          slice = makeArithReduction(rewriter, loc, combiningKind, unpacked,
-                                      slice, mask);
-        }
-
-        if (bitWidth > 16) {
-          SmallVector<int64_t> offset{n};
-          SmallVector<int64_t> one{1};
-          newVector = rewriter.create<vector::InsertStridedSliceOp>(loc, slice, newVector, offset, one);
-        }
-
+      if (bitWidth == 32) {
+        tmp = rewriter.create<vector::InsertOp>(loc, x, tmp, SmallVector<int64_t>{0});
+      } else {
+        int index = count % 2;
+        count++;
+        tmp = rewriter.create<vector::InsertOp>(loc, x, tmp, SmallVector<int64_t>{index});
+        if (index == 0) return;
       }
 
-      if (bitWidth > 16)
-        vector = newVector;
+      result = makeArithReduction(rewriter, loc, combiningKind, result, tmp, mask);
+    };
 
-      // Since this is a broadcasted tensor, we only need to extract the 0th
-      // element
-      if (!result)
-        result = rewriter.create<vector::ExtractOp>(
-            loc, simdToSimtMap.at(acc),
-            SmallVector<int64_t>{state[DimType::Batch0], state[DimType::Batch1],
-                                 vectorOffset, 0});
-      for (int i = 0; i < vShape[0]; i++) {
-        Value v = rewriter.create<vector::ExtractOp>(loc, vector,
-                                                     SmallVector<int64_t>{i});
+    iterate(0, reductionOrder, state, layout, reduceLocal);
+
+    auto reduceGlobal = [&]() {
+
+      for (uint64_t i = offset; i < offset * layout.shape[dimType]; i <<= 1) {
+        Value packed = packVectorToSupportedWidth(loc, rewriter, result);
+        auto shuffleOp = rewriter.create<gpu::ShuffleOp>(loc, packed, i, size,
+                                                         gpu::ShuffleMode::XOR);
+        Value unpacked =
+            unpackToVector(loc, rewriter, shuffleOp.getShuffleResult(),
+                           result.getType().cast<VectorType>());
+        result = makeArithReduction(rewriter, loc, combiningKind, unpacked,
+                                    result, mask);
+      }
+
+      // Convert to f16 or f32
+      if (bitWidth == 32) {
+        result = rewriter.create<vector::ExtractOp>(loc, result,
+                                                    SmallVector<int64_t>{0});
+      } else {
+        Value v0 = rewriter.create<vector::ExtractOp>(loc, result,
+                                                     SmallVector<int64_t>{0});
+        Value v1 = rewriter.create<vector::ExtractOp>(loc, result,
+                                                     SmallVector<int64_t>{1});
         result =
-            makeArithReduction(rewriter, loc, combiningKind, result, v, mask);
+            makeArithReduction(rewriter, loc, combiningKind, v0, v1, mask);
       }
     };
 
-    // Iterate only over batch dimension
-    std::array<int, 1> batchDim = {{reductionOrder.back()}};
-    iterate(0, batchDim, state, layout, reduce);
+    reduceGlobal();
 
     auto broadcastResult = [&](std::array<int, DimType::NumDims> &state) {
       output = rewriter.create<vector::InsertOp>(
@@ -1356,6 +1355,9 @@ static void distributeReductionBroadcastTranspose(
 
     // Broadcast result to same shape as original
     iterate(0, reductionOrder, state, layout, broadcastResult);
+
+    // Reset state
+    state.fill(0);
   };
 
   std::array<int, DimType::NumDims> state;
