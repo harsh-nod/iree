@@ -1282,13 +1282,8 @@ static void distributeReductionBroadcastTranspose(
     int count{0};
     if (bitWidth == 32) {
       tmp = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(VectorType::get({1}, elementType)));
-      result = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(VectorType::get({1}, elementType)));
-      result = rewriter.create<vector::InsertOp>(loc, accValue, result, SmallVector<int64_t>{0});
     } else {
       tmp = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(VectorType::get({2}, elementType)));
-      result = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(VectorType::get({2}, elementType)));
-      result = rewriter.create<vector::InsertOp>(loc, accValue, result, SmallVector<int64_t>{0});
-      result = rewriter.create<vector::InsertOp>(loc, accValue, result, SmallVector<int64_t>{1});
     }
 
     // Returns vector<1xf32> or vector<2xf16>
@@ -1309,7 +1304,10 @@ static void distributeReductionBroadcastTranspose(
         if (index == 0) return;
       }
 
-      result = makeArithReduction(rewriter, loc, combiningKind, result, tmp, mask);
+      if (!result)
+        result = tmp;
+      else
+        result = makeArithReduction(rewriter, loc, combiningKind, result, tmp, mask);
     };
 
     iterate(0, reductionOrder, state, layout, reduceLocal);
@@ -1329,8 +1327,10 @@ static void distributeReductionBroadcastTranspose(
 
       // Convert to f16 or f32
       if (bitWidth == 32) {
-        result = rewriter.create<vector::ExtractOp>(loc, result,
-                                                    SmallVector<int64_t>{0});
+        Value v0 = rewriter.create<vector::ExtractOp>(loc, result,
+                                                      SmallVector<int64_t>{0});
+        result =
+            makeArithReduction(rewriter, loc, combiningKind, v0, accValue, mask);
       } else {
         Value v0 = rewriter.create<vector::ExtractOp>(loc, result,
                                                      SmallVector<int64_t>{0});
@@ -1338,6 +1338,8 @@ static void distributeReductionBroadcastTranspose(
                                                      SmallVector<int64_t>{1});
         result =
             makeArithReduction(rewriter, loc, combiningKind, v0, v1, mask);
+        result =
+            makeArithReduction(rewriter, loc, combiningKind, result, accValue, mask);
       }
     };
 
