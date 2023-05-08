@@ -69,7 +69,7 @@ static Value computePartialSoftmax(Value qkTranspose, Value currentMax,
       indexingMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
         Value diff = b.create<arith::SubFOp>(loc, args[1], args[0]);
-        Value result = b.create<math::ExpOp>(loc, diff);
+        Value result = b.create<math::Exp2Op>(loc, diff);
         b.create<linalg::YieldOp>(loc, result);
       });
   ops.push_back(genericOp);
@@ -89,7 +89,7 @@ static Value updateAndScale(Value oldMax, Value newMax, Value oldSum,
       indexingMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
         Value diff = b.create<arith::SubFOp>(loc, args[0], args[1]);
-        Value weight = b.create<math::ExpOp>(loc, diff);
+        Value weight = b.create<math::Exp2Op>(loc, diff);
         Value scaledOldSum = b.create<arith::MulFOp>(loc, weight, args[2]);
         b.create<linalg::YieldOp>(loc, ValueRange{scaledOldSum});
       });
