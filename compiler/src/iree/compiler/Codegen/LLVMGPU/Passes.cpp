@@ -514,8 +514,8 @@ static void addLowerToLLVMGPUPasses(OpPassManager &pm, bool useROCM) {
   // math dialect elementry functions -> polynomial form.
   //pm.addNestedPass<func::FuncOp>(createPolynomialApproximationPass());
 
-  pm.addNestedPass<func::FuncOp>(
-      arith::createArithExpandOpsPass({/*include-bf16=*/true}));
+  //pm.addNestedPass<func::FuncOp>(
+  //    arith::createArithExpandOpsPass({/*include-bf16=*/true}));
   pm.addNestedPass<func::FuncOp>(memref::createExpandOpsPass());
   pm.addPass(memref::createExpandStridedMetadataPass());
   pm.addPass(createLowerAffinePass());
@@ -561,7 +561,12 @@ void buildLLVMGPUTransformPassPipeline(OpPassManager &pm, bool useROCM) {
       createGPUDistributeSharedMemoryCopy());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
+
   OpPassManager &nestedModulePM = pm.nest<ModuleOp>();
+  nestedModulePM.addNestedPass<func::FuncOp>(createLLVMGPUVectorToGPU());
+  nestedModulePM.addPass(createCanonicalizerPass());
+  nestedModulePM.addPass(createCSEPass());
+
   //===--------------------------------------------------------------------===//
   // Convert Linalg ops to LLVM+NVVM/ROCDL ops.
   //

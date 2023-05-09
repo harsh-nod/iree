@@ -475,9 +475,11 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   Value max = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
   auto maxFill =
       rewriter.create<linalg::FillOp>(loc, ValueRange{largeNegativeF32}, max);
+  ops.push_back(maxFill);
   Value negativeMax = maxFill.result();
   Value sum = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
   auto sumFill = rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, sum);
+  ops.push_back(sumFill);
   Value zeroSum = sumFill.result();
 
   // Construct second loop
