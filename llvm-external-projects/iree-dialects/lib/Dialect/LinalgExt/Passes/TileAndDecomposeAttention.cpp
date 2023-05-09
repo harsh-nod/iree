@@ -248,6 +248,13 @@ extractSlicesInner(Value query, Value output, Value max, Value sum,
   auto tensorType = RankedTensorType::get(tensorShape, elementType);
   Value querySlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, query, offsets, sizes, strides);
+
+  offsets = SmallVector<OpFoldResult>(queryShape.size() - 1, zero);
+  sizes = SmallVector<OpFoldResult>(queryShape.size() - 1, one);
+  strides = SmallVector<OpFoldResult>(queryShape.size() - 1, one);
+  offsets[0] = ivs[2];
+  sizes[0] = sequenceTileLength;
+  sizes[1] = headDimension;
   tensorType = RankedTensorType::get(tensorShape, builder.getF32Type());
   Value outputSlice = builder.create<tensor::ExtractSliceOp>(
       loc, tensorType, output, offsets, sizes, strides);
@@ -275,13 +282,12 @@ static void insertSlicesInner(Value newResult, Value result, Value newMax,
   auto one = builder.getIndexAttr(1);
   auto zero = builder.getIndexAttr(0);
   auto headDimension = builder.getIndexAttr(queryShape.back());
-  SmallVector<OpFoldResult> strides(queryShape.size(), one);
-  SmallVector<OpFoldResult> sizes(queryShape.size(), one);
-  SmallVector<OpFoldResult> offsets(queryShape.size(), zero);
-  sizes[1] = sequenceTileLength;
-  sizes[2] = headDimension;
-  offsets[0] = ivs[0];
-  offsets[1] = ivs[2];
+  SmallVector<OpFoldResult> strides(queryShape.size() - 1, one);
+  SmallVector<OpFoldResult> sizes(queryShape.size() - 1, one);
+  SmallVector<OpFoldResult> offsets(queryShape.size() - 1, zero);
+  sizes[0] = sequenceTileLength;
+  sizes[1] = headDimension;
+  offsets[0] = ivs[2];
   builder.create<tensor::ParallelInsertSliceOp>(loc, newResult, result, offsets,
                                                 sizes, strides);
   offsets = SmallVector<OpFoldResult>(queryShape.size() - 2, zero);
@@ -351,6 +357,27 @@ Value truncateToF16(Value input, Value output, OpBuilder &builder, Location loc)
   return genericOp.getResult(0);
 }
 
+template <int T>
+Value truncateToF16DPS(Value output, OpBuilder &builder, Location loc, SmallVectorImpl<Operation *> &ops) {
+  AffineMap identityMap =
+      AffineMap::getMultiDimIdentityMap(T, builder.getContext());
+  AffineExpr d0, d1;
+  bindDims(builder.getContext(), d0, d1);
+  // (d0, d1) -> (d0)
+  auto rowMap = AffineMap::get(T, 0, {d0}, builder.getContext());
+  SmallVector<AffineMap> indexingMaps{identityMap};
+  SmallVector<utils::IteratorType> iteratorTypes(T,
+                                                 utils::IteratorType::parallel);
+  auto genericOp = builder.create<linalg::GenericOp>(
+      loc, output.getType(), ValueRange{},
+      output, indexingMaps, iteratorTypes,
+      [&](OpBuilder &b, Location loc, ValueRange args) {
+        Value result = b.create<arith::TruncFOp>(loc, b.getF16Type(), args[0]);
+        b.create<linalg::YieldOp>(loc, result);
+      });
+  ops.push_back(genericOp);
+  return genericOp.getResult(0);
+}
 
 static std::tuple<Value, Value, Value>
 createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
@@ -444,16 +471,6 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   }
   output = ret.value();
 
-  auto shape = output.getType().cast<ShapedType>().getShape();
-  auto outputF32Type = RankedTensorType::get(shape, rewriter.getF32Type());
-  Value outputF32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(outputF32Type));
-  ret = bufferization::allocateTensorForShapedValue(
-                rewriter, loc, outputF32, false, options, true);
-  if (failed(ret)) {
-    return {};
-  }
-  outputF32 = ret.value();
-
   // Construct first loop
   Value zeroValue = rewriter.create<arith::ConstantIndexOp>(loc, 0);
   Value oneValue = rewriter.create<arith::ConstantIndexOp>(loc, 1);
@@ -461,17 +478,25 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   scf::LoopNest firstLoopNest = createLoopNest(
       ivs, zeroValue, oneValue,
       getValueOrCreateConstantIndexOp(rewriter, loc, batchTileLength),
-      ValueRange({outputF32}), loc, rewriter);
+      ValueRange({output}), loc, rewriter);
   Value iterArg = firstLoopNest.loops.back().getRegionIterArg(0);
   ops.push_back(firstLoopNest.loops.back());
 
   OpBuilder::InsertionGuard guardFirstLoop(rewriter);
   rewriter.setInsertionPointToStart(firstLoopNest.loops.back().getBody());
 
-  // Create max and sum statistics
-  SmallVector<OpFoldResult> dims{sequenceTileLength};
+  // Create output in fp32
+  auto shape = iterArg.getType().cast<ShapedType>().getShape();
   Type statType = rewriter.getF32Type();
   Value zeroF32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(statType));
+  Value outputEmpty = rewriter.create<tensor::EmptyOp>(loc, SmallVector<int64_t>{shape[1], shape[2]}, statType);
+  auto outputFill =
+      rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, outputEmpty);
+  Value outputF32 = outputFill.result();
+  ops.push_back(outputFill);
+
+  // Create max and sum statistics
+  SmallVector<OpFoldResult> dims{sequenceTileLength};
   Value largeNegativeF32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(statType, -1.0e+30));
   Value max = rewriter.create<tensor::EmptyOp>(loc, dims, statType);
   auto maxFill =
@@ -488,7 +513,7 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
       ivs, zeroValue,
       getValueOrCreateConstantIndexOp(rewriter, loc, sequenceTileLength),
       getValueOrCreateConstantIndexOp(rewriter, loc, sequenceLength),
-      ValueRange({iterArg, negativeMax, zeroSum}), loc, rewriter);
+      ValueRange({outputF32, negativeMax, zeroSum}), loc, rewriter);
   ops.push_back(secondLoopNest.loops.back());
 
   Value iterArgResult = secondLoopNest.loops.back().getRegionIterArg(0);
@@ -581,15 +606,27 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
           firstLoopNest.loops.back().getBody()->getTerminator())) {
     OpBuilder::InsertionGuard yieldGuard(rewriter);
     rewriter.setInsertionPoint(yieldOp);
+    auto shape = secondLoopNest.results[0].getType().cast<ShapedType>().getShape();
+    result = truncateToF16DPS<2>(secondLoopNest.results[0], rewriter, loc, ops);
+    auto one = rewriter.getIndexAttr(1);
+    auto zero = rewriter.getIndexAttr(0);
+    SmallVector<OpFoldResult> strides(shape.size() + 1, one);
+    SmallVector<OpFoldResult> sizes(shape.size() + 1, one);
+    SmallVector<OpFoldResult> offsets(shape.size() + 1, zero);
+    sizes[1] = sequenceTileLength;
+    sizes[2] = headDimension;
+    offsets[0] = ivs[0];
+    result = rewriter.create<tensor::InsertSliceOp>(
+        loc, result, iterArg, offsets, sizes, strides);
     rewriter.replaceOpWithNewOp<scf::YieldOp>(
-        yieldOp, ValueRange{secondLoopNest.results[0]});
+        yieldOp, ValueRange{result});
   }
 
-  OpBuilder::InsertionGuard forGuard(rewriter);
-  rewriter.setInsertionPointAfter(firstLoopNest.loops[0]);
+  //OpBuilder::InsertionGuard forGuard(rewriter);
+  //rewriter.setInsertionPointAfter(firstLoopNest.loops[0]);
   //ArrayRef<int64_t> resultShape = firstLoopNest.results[0].getType().cast<ShapedType>().getShape();
   //Value scratch = rewriter.create<tensor::EmptyOp>(loc, resultShape, rewriter.getF16Type());
-  result = truncateToF16<3>(firstLoopNest.results[0], output, rewriter, loc);
+  //result = truncateToF16<3>(firstLoopNest.results[0], output, rewriter, loc);
 
   //attnOp->getParentOfType<ModuleOp>().dump();
   attnOp.getResults()[0].replaceAllUsesWith(result);
