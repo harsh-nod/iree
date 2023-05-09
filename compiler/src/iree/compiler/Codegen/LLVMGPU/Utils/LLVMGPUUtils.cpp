@@ -337,7 +337,7 @@ void eliminateTripToSharedMemory(IRRewriter &rewriter, func::FuncOp funcOp) {
             rewriter.create(op->getLoc(), op->getName().getIdentifier(),
                             src, resultType, op->getAttrs());
         Value newSrc;
-        Operation *secondWrite;
+        vector::TransferWriteOp secondWrite;
         for (Operation *user : op->getResult(0).getUsers()) {
           if (auto newWriteOp = dyn_cast<vector::TransferWriteOp>(user)) {
             newSrc = newWriteOp.getSource();
@@ -345,8 +345,21 @@ void eliminateTripToSharedMemory(IRRewriter &rewriter, func::FuncOp funcOp) {
           }
         }
         if (!newSrc) return;
+        auto secondWriteIndices = secondWrite.getIndices();
+        auto firstWriteIndices = writeOp.getIndices();
+        int delta{0};
+        if (secondWriteIndices.size() > firstWriteIndices.size()) {
+          delta = secondWriteIndices.size() - firstWriteIndices.size();
+        }
+        SmallVector<Value> indices;
+        for (int i = 0; i < secondWriteIndices.size(); i++) {
+          if (i < delta)
+            indices.push_back(secondWriteIndices[i]);
+          else
+            indices.push_back(firstWriteIndices[i - delta]);
+        }
         rewriter.create<vector::TransferWriteOp>(op->getLoc(), newOp->getResult(0),
-                                                 newSrc, writeOp.getIndices(), writeOp.getPermutationMapAttr(),
+                                                 newSrc, indices, secondWrite.getPermutationMapAttr(),
                                                  writeOp.getInBoundsAttr());
         toErase.push_back(secondWrite);
         toErase.push_back(op);
