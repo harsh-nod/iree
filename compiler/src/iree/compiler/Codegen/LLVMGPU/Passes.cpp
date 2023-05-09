@@ -563,7 +563,7 @@ void buildLLVMGPUTransformPassPipeline(OpPassManager &pm, bool useROCM) {
   pm.addPass(createCSEPass());
 
   OpPassManager &nestedModulePM = pm.nest<ModuleOp>();
-  nestedModulePM.addNestedPass<func::FuncOp>(createLLVMGPUVectorToGPU());
+  nestedModulePM.addNestedPass<func::FuncOp>(createLLVMGPUVectorToGPU(GPUTensorCoreType::MMA_SYNC));
   nestedModulePM.addPass(createCanonicalizerPass());
   nestedModulePM.addPass(createCSEPass());
 
