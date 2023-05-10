@@ -21,12 +21,20 @@
 namespace mlir {
 namespace iree_compiler {
 
+static bool hasAsyncCopyUses(memref::AllocOp allocOp) {
+  for (Operation *user : allocOp.getMemref().getUsers()) {
+    if (auto asyncCopyOp = dyn_cast<nvgpu::DeviceAsyncCopyOp>(user)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void swizzleSharedMemory(func::FuncOp funcOp) {
   SmallVector<memref::AllocOp> shmAllocOps;
   funcOp->walk([&](memref::AllocOp allocOp) {
     // Only apply it to shared memory of input operands.
-    if (!hasSharedMemoryAddressSpace(allocOp.getType()) ||
-        allocOp.getType().getRank() < 3) {
+    if (!hasSharedMemoryAddressSpace(allocOp.getType()) || !hasAsyncCopyUses(allocOp)) {
       return;
     }
     shmAllocOps.push_back(allocOp);
