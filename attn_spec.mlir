@@ -8,8 +8,9 @@ transform.sequence failures(propagate) {
     // Tile and distribute to workgroups
     // ==========================================
     %forall_grid, %tiled_attention =
-    transform.iree.tile_to_forall_and_workgroup_count_region %attention tile_sizes [1, 128]
+    transform.structured.tile_to_forall_op %attention tile_sizes [1, 128]
       ( mapping = [#gpu.block<x>, #gpu.block<y>] )
+    transform.iree.populate_workgroup_count_region_using_num_threads_slice %forall_grid : (!pdl.operation) -> ()
 
     // Tile and decompose attention
     // ==========================================
