@@ -695,11 +695,11 @@ static Value emitLdMatrix4(OpBuilder &rewriter, Location loc, Layout &layout,
   AffineMap rowMap = AffineMap::get(3, 0, row, rewriter.getContext());
   std::array<Value, 2> vectorOffsets;
   vectorOffsets[0] =
-      rewriter.create<AffineApplyOp>(loc, rowMap, threadIdsLdMatrix);
+      rewriter.create<affine::AffineApplyOp>(loc, rowMap, threadIdsLdMatrix);
   AffineExpr col = layout.computeDim(1, state, rewriter);
   AffineMap colMap = AffineMap::get(3, 0, col, rewriter.getContext());
   vectorOffsets[1] =
-      rewriter.create<AffineApplyOp>(loc, colMap, threadIdsLdMatrix);
+      rewriter.create<affine::AffineApplyOp>(loc, colMap, threadIdsLdMatrix);
 
   AffineExpr d0, d1, d2, d3;
   bindDims(rewriter.getContext(), d0, d1, d2, d3);
@@ -707,17 +707,17 @@ static Value emitLdMatrix4(OpBuilder &rewriter, Location loc, Layout &layout,
   std::array<Value, 2> blockOffsetsY;
   {
     AffineExpr laneIdModuloX = (d0 + d1 * 4).floorDiv(8) % 2;
-    Value BlockIdX = rewriter.create<AffineApplyOp>(
+    Value BlockIdX = rewriter.create<affine::AffineApplyOp>(
         loc, laneIdModuloX, ArrayRef<Value>({threadIds[0], threadIds[1]}));
     std::array<int, DimType::NumDims> blockState = {0};
     blockState[dimX] = 1;
     AffineExpr row2 = layout.computeDim(0, blockState, rewriter);
     AffineMap rowMap2 = AffineMap::get(3, 0, row2, rewriter.getContext());
     std::array<Value, 3> threads = {zero, zero, zero};
-    blockOffsetsX[0] = rewriter.create<AffineApplyOp>(loc, rowMap2, threads);
+    blockOffsetsX[0] = rewriter.create<affine::AffineApplyOp>(loc, rowMap2, threads);
     AffineExpr col2 = layout.computeDim(1, blockState, rewriter);
     AffineMap colMap2 = AffineMap::get(3, 0, col2, rewriter.getContext());
-    blockOffsetsX[1] = rewriter.create<AffineApplyOp>(loc, colMap2, threads);
+    blockOffsetsX[1] = rewriter.create<affine::AffineApplyOp>(loc, colMap2, threads);
     blockOffsetsX[0] =
         rewriter.create<arith::MulIOp>(loc, blockOffsetsX[0], BlockIdX);
     blockOffsetsX[1] =
@@ -726,17 +726,17 @@ static Value emitLdMatrix4(OpBuilder &rewriter, Location loc, Layout &layout,
 
   {
     AffineExpr laneIdModuloY = (d0 + d1 * 4).floorDiv(16);
-    Value BlockIdY = rewriter.create<AffineApplyOp>(
+    Value BlockIdY = rewriter.create<affine::AffineApplyOp>(
         loc, laneIdModuloY, ArrayRef<Value>({threadIds[0], threadIds[1]}));
     std::array<int, DimType::NumDims> blockState = {0};
     blockState[dimY] = 1;
     AffineExpr row2 = layout.computeDim(0, blockState, rewriter);
     AffineMap rowMap2 = AffineMap::get(3, 0, row2, rewriter.getContext());
     std::array<Value, 3> threads = {zero, zero, zero};
-    blockOffsetsY[0] = rewriter.create<AffineApplyOp>(loc, rowMap2, threads);
+    blockOffsetsY[0] = rewriter.create<affine::AffineApplyOp>(loc, rowMap2, threads);
     AffineExpr col2 = layout.computeDim(1, blockState, rewriter);
     AffineMap colMap2 = AffineMap::get(3, 0, col2, rewriter.getContext());
-    blockOffsetsY[1] = rewriter.create<AffineApplyOp>(loc, colMap2, threads);
+    blockOffsetsY[1] = rewriter.create<affine::AffineApplyOp>(loc, colMap2, threads);
 
     blockOffsetsY[0] =
         rewriter.create<arith::MulIOp>(loc, blockOffsetsY[0], BlockIdY);
@@ -747,7 +747,7 @@ static Value emitLdMatrix4(OpBuilder &rewriter, Location loc, Layout &layout,
   // Then compute the offset for each lane.
 
   AffineExpr laneIdModuloEight = (d0 + d1 * 4) % 8;
-  Value laneId = rewriter.create<AffineApplyOp>(
+  Value laneId = rewriter.create<affine::AffineApplyOp>(
       loc, laneIdModuloEight, ArrayRef<Value>({threadIds[0], threadIds[1]}));
 
   std::array<int, DimType::NumDims> emptyState = {0};
@@ -756,11 +756,11 @@ static Value emitLdMatrix4(OpBuilder &rewriter, Location loc, Layout &layout,
   AffineMap rowMap2 = AffineMap::get(3, 0, row2, rewriter.getContext());
   std::array<Value, 2> laneOffsets;
   laneOffsets[0] =
-      rewriter.create<AffineApplyOp>(loc, rowMap2, threadIdsLdMatrix);
+      rewriter.create<affine::AffineApplyOp>(loc, rowMap2, threadIdsLdMatrix);
   AffineExpr col2 = layout.computeDim(1, emptyState, rewriter);
   AffineMap colMap2 = AffineMap::get(3, 0, col2, rewriter.getContext());
   laneOffsets[1] =
-      rewriter.create<AffineApplyOp>(loc, colMap2, threadIdsLdMatrix);
+      rewriter.create<affine::AffineApplyOp>(loc, colMap2, threadIdsLdMatrix);
   SmallVector<Value> newIndices{indices.begin(), indices.end()};
   int64_t laneDim = 0;
   // When transposing we need to swap the lane offsets.
