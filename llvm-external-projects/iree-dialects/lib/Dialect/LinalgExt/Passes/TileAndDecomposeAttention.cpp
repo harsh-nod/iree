@@ -124,15 +124,11 @@ static Value computeReciprocal(Value x, Location loc,
                               SmallVectorImpl<Operation *> &ops) {
   AffineMap identityMap =
       AffineMap::getMultiDimIdentityMap(1, builder.getContext());
-  AffineExpr d0;
-  bindDims(builder.getContext(), d0);
-  // (d0, d1) -> (d0)
-  auto rowMap = AffineMap::get(1, 0, {d0}, builder.getContext());
-  SmallVector<AffineMap> indexingMaps{identityMap, identityMap};
-  SmallVector<utils::IteratorType> iteratorTypes(2,
+  SmallVector<AffineMap> indexingMaps{identityMap};
+  SmallVector<utils::IteratorType> iteratorTypes(1,
                                                  utils::IteratorType::parallel);
   auto genericOp = builder.create<linalg::GenericOp>(
-      loc, x.getType(), ValueRange{x},
+      loc, x.getType(), ValueRange{},
       x, indexingMaps, iteratorTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
         Value one = b.create<arith::ConstantOp>(loc, b.getFloatAttr(args[0].getType(), 1.0));
@@ -606,7 +602,8 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
     OpBuilder::InsertionGuard yieldGuard(rewriter);
     rewriter.setInsertionPoint(yieldOp);
     auto shape = secondLoopNest.results[0].getType().cast<ShapedType>().getShape();
-    result = truncateToF16DPS<2>(secondLoopNest.results[0], rewriter, loc, ops);
+    Value scratch = rewriter.create<tensor::EmptyOp>(loc, shape, rewriter.getF16Type());
+    result = truncateToF16<2>(secondLoopNest.results[0], scratch, rewriter, loc);
     auto one = rewriter.getIndexAttr(1);
     auto zero = rewriter.getIndexAttr(0);
     SmallVector<OpFoldResult> strides(shape.size() + 1, one);
