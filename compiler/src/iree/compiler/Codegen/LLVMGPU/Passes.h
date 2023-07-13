@@ -37,7 +37,7 @@ void addGPUPackUnPackPasses(OpPassManager &pm);
 void addGPUSimpleDistributePassPipeline(OpPassManager &pm);
 
 /// Transform dialect-based path.
-void addGPUTransformDialectPasses(OpPassManager &pm);
+void addGPUTransformDialectPasses(OpPassManager &pm, std::string codegenSpecFileName);
 
 /// Lowering transpose using shared memory.
 void addGPUTransposePassPipeline(OpPassManager &pm);
