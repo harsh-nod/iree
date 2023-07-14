@@ -38,7 +38,7 @@ struct GPUMultiBufferingPass
     });
     // Apply multi-buffering to all of them.
     for (memref::AllocOp alloc : allocs) {
-      if (failed(memref::multiBuffer(alloc, numBuffers)))
+      if (failed(memref::multiBuffer(alloc, numBuffers, true)))
         // Stop if any buffer cannot be multi buffered as pipelining will assume
         // this happened.
         return signalPassFailure();

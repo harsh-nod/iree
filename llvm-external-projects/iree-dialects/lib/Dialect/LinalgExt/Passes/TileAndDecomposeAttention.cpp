@@ -481,10 +481,11 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   rewriter.setInsertionPointToStart(firstLoopNest.loops.back().getBody());
 
   // Create output in fp32
-  auto shape = iterArg.getType().cast<ShapedType>().getShape();
+  SmallVector<OpFoldResult> shape =
+      tensor::createDimValues(rewriter, loc, iterArg);
   Type statType = rewriter.getF32Type();
   Value zeroF32 = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(statType));
-  Value outputEmpty = rewriter.create<tensor::EmptyOp>(loc, SmallVector<int64_t>{shape[1], shape[2]}, statType);
+  Value outputEmpty = rewriter.create<tensor::EmptyOp>(loc, SmallVector<OpFoldResult>{shape[1], shape[2]}, statType);
   auto outputFill =
       rewriter.create<linalg::FillOp>(loc, ValueRange{zeroF32}, outputEmpty);
   Value outputF32 = outputFill.result();
@@ -538,7 +539,7 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   valueSlice = ret.value();
 
   // Construct third loop
-  int64_t tileSize{32};
+  int64_t tileSize{16};
   OpFoldResult warpSize = rewriter.getIndexAttr(tileSize);
   // Number of warps to distribute on
   OpFoldResult numWarps = rewriter.getIndexAttr(4);
@@ -601,7 +602,7 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
           firstLoopNest.loops.back().getBody()->getTerminator())) {
     OpBuilder::InsertionGuard yieldGuard(rewriter);
     rewriter.setInsertionPoint(yieldOp);
-    auto shape = secondLoopNest.results[0].getType().cast<ShapedType>().getShape();
+    SmallVector<OpFoldResult> shape = tensor::createDimValues(rewriter, loc, secondLoopNest.results[0]);
     Value scratch = rewriter.create<tensor::EmptyOp>(loc, shape, rewriter.getF16Type());
     result = truncateToF16<2>(secondLoopNest.results[0], scratch, rewriter, loc);
     auto one = rewriter.getIndexAttr(1);
@@ -624,8 +625,7 @@ tileAndDecomposeAttention(IREE::LinalgExt::AttentionOp attnOp,
   //Value scratch = rewriter.create<tensor::EmptyOp>(loc, resultShape, rewriter.getF16Type());
   //result = truncateToF16<3>(firstLoopNest.results[0], output, rewriter, loc);
 
-  //attnOp->getParentOfType<ModuleOp>().dump();
-  attnOp.getResults()[0].replaceAllUsesWith(result);
+  attnOp.getResults()[0].replaceAllUsesWith(firstLoopNest.results[0]);
   return ops;
 }
 

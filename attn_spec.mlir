@@ -8,7 +8,7 @@ transform.sequence failures(propagate) {
     // Tile and distribute to workgroups
     // ==========================================
     %forall_grid, %tiled_attention =
-    transform.structured.tile_to_forall_op %attention tile_sizes [1, 128]
+    transform.structured.tile_to_forall_op %attention tile_sizes [1, 64]
       ( mapping = [#gpu.block<x>, #gpu.block<y>] )
     transform.iree.populate_workgroup_count_region_using_num_threads_slice %forall_grid : (!pdl.operation) -> ()
 
@@ -22,7 +22,7 @@ transform.sequence failures(propagate) {
     // Distribute fills
     // ==========================================
     %fills = transform.merge_handles %output_fill, %max_fill, %sum_fill : !pdl.operation
-    %fill_grid, %tiled_fill = transform.structured.tile_to_forall_op %fills tile_sizes[32] (mapping = [#gpu.warp<x>])
+    %fill_grid, %tiled_fill = transform.structured.tile_to_forall_op %fills tile_sizes[16] (mapping = [#gpu.warp<x>])
 
     // Vectorize function
     // ==========================================

@@ -567,13 +567,20 @@ void buildLLVMGPUTransformPassPipeline(OpPassManager &pm, bool useROCM) {
   nestedModulePM.addPass(createCanonicalizerPass());
   nestedModulePM.addPass(createCSEPass());
 
+  int pipelineDepth = 1;
+  if (pipelineDepth > 1)
+    nestedModulePM.addNestedPass<func::FuncOp>(
+        createGPUMultiBuffering(pipelineDepth));
+  nestedModulePM.addPass(createCanonicalizerPass());
+  nestedModulePM.addPass(createCSEPass());
+
   // Hoist loop invariant code to avoid pipelining it.
   nestedModulePM.addNestedPass<func::FuncOp>(
       createLoopInvariantCodeMotionPass());
   // Pipeline memory operations.
-  nestedModulePM.addNestedPass<func::FuncOp>(createGPUPipeliningPass(
-      /*epiloguePeeling=*/false, 1,
-      PipeliningSchedulingStrategy::loadGlobalStage0));
+  //nestedModulePM.addNestedPass<func::FuncOp>(createGPUPipeliningPass(
+  //    /*epiloguePeeling=*/false, pipelineDepth,
+  //    PipeliningSchedulingStrategy::loadGlobalStage0));
   // Optimize shared memory usage.
   nestedModulePM.addNestedPass<func::FuncOp>(
       createLLVMGPUPackSharedMemoryAlloc());

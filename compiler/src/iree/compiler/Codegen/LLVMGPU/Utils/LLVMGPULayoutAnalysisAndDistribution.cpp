@@ -935,13 +935,28 @@ bool resolveLayoutConficts(Value vector,
     if (llvm::all_of(mismatchedDims,
                      [](int dimType) { return isBatchId(dimType); })) {
       int batchDim = mismatchedDims[0];
-      if (currentLayout.shape[batchDim] < targetLayout.shape[batchDim]) return false;
-      ArrayRef<int64_t> vectorShape = simdToSimtMap.at(vector).getType().cast<VectorType>().getShape();
+      VectorType vectorType = simdToSimtMap.at(vector).getType().cast<VectorType>();
+      ArrayRef<int64_t> vectorShape = vectorType.getShape();
       SmallVector<int64_t> offsets(vectorShape.size(), 0);
       SmallVector<int64_t> strides(vectorShape.size(), 1);
       SmallVector<int64_t> shape(vectorShape);
       shape[batchDim] = targetLayout.shape[batchDim];
-      Value newVector = rewriter.create<vector::ExtractStridedSliceOp>(loc, simdToSimtMap.at(vector), offsets, shape, strides);
+      Value newVector;
+      if (currentLayout.shape[batchDim] > targetLayout.shape[batchDim]) {
+        newVector = rewriter.create<vector::ExtractStridedSliceOp>(loc, simdToSimtMap.at(vector), offsets, shape, strides);
+      } else {
+        Value transposedVector = simdToSimtMap.at(vector);
+        if (batchDim == DimType::Batch1) {
+          transposedVector = rewriter.create<vector::TransposeOp>(loc, transposedVector, ArrayRef<int64_t>{1, 0, 2, 3});
+          std::swap(shape[DimType::Batch0], shape[DimType::Batch1]);
+        }
+        transposedVector = rewriter.create<vector::ExtractOp>(loc, transposedVector, ArrayRef<int64_t>{0});
+        Type elementType = vectorType.getElementType();
+        newVector = rewriter.create<vector::BroadcastOp>(loc, VectorType::get(shape, elementType), transposedVector);
+        if (batchDim == DimType::Batch1) {
+          newVector = rewriter.create<vector::TransposeOp>(loc, newVector, ArrayRef<int64_t>{1, 0, 2, 3});
+        }
+      }
       simdToSimtMap[vector] = newVector;
       batch0 = batchDim == DimType::Batch0 ? targetLayout.shape[DimType::Batch0] : currentLayout.shape[DimType::Batch0];
       batch1 = batchDim == DimType::Batch1 ? targetLayout.shape[DimType::Batch1] : currentLayout.shape[DimType::Batch1];
