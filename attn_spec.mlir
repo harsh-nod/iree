@@ -15,13 +15,13 @@ transform.sequence failures(propagate) {
     // Tile and decompose attention
     // ==========================================
     %attention2 = transform.structured.match ops{["iree_linalg_ext.attention"]} in %variant_op : (!pdl.operation) -> !pdl.operation
-    %outer_loop, %output_fill, %max_fill, %sum_fill, %mid_loop, %inner_loop, %fill_op, %first_matmul, %reduce_max, %partial_softmax, %reduce_sum, %reciprocal_sum, %update,
-    %softmax, %scale_acc, %second_matmul = tile_and_decompose_attention %attention2 :
-       (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation)
+    %outer_loop, %output_fill, %max_fill, %sum_fill, %mid_loop, %inner_loop, %fill_op, %first_matmul, %reduce_max, %partial_softmax, %scale_factor, %update, %reduce_sum,
+    %truncate1, %scale_acc, %second_matmul, %final_scaling, %truncate2 = tile_and_decompose_attention %attention2 :
+       (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation, !pdl.operation)
 
     // Distribute fills
     // ==========================================
-    %fills = transform.merge_handles %output_fill, %max_fill, %sum_fill : !pdl.operation
+    %fills = transform.merge_handles %output_fill, %max_fill, %sum_fill, %truncate2, %final_scaling : !pdl.operation
     %fill_grid, %tiled_fill = transform.structured.tile_to_forall_op %fills tile_sizes[16] (mapping = [#gpu.warp<x>])
 
     // Vectorize function
@@ -68,6 +68,6 @@ transform.sequence failures(propagate) {
     %func_x = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
     transform.iree.apply_patterns %func_x {  prepare_vector_to_mma, cse } : (!pdl.operation) -> ()
     %func_y = transform.structured.match ops{["func.func"]} in %variant_op_3 : (!pdl.operation) -> !pdl.operation
-    %preproc_func = transform.iree.eliminate_shmem_trip %func_y : (!pdl.operation) -> !pdl.operation
-    %func_11 = transform.iree.layout_analysis_and_distribution %preproc_func : (!pdl.operation) -> (!pdl.operation)
+    //%preproc_func = transform.iree.eliminate_shmem_trip %func_y : (!pdl.operation) -> !pdl.operation
+    %func_11 = transform.iree.layout_analysis_and_distribution %func_y : (!pdl.operation) -> (!pdl.operation)
 }
