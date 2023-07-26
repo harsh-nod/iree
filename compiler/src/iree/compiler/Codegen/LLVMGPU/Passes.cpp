@@ -563,6 +563,16 @@ void buildLLVMGPUTransformPassPipeline(OpPassManager &pm, bool useROCM) {
   pm.addPass(createCSEPass());
 
   OpPassManager &nestedModulePM = pm.nest<ModuleOp>();
+
+  //nestedModulePM.addNestedPass<func::FuncOp>(
+  //    createGPUReduceSharedMemoryBankConflicts());
+  //nestedModulePM.addPass(createCanonicalizerPass());
+  //nestedModulePM.addPass(createCSEPass());
+  //nestedModulePM.addNestedPass<func::FuncOp>(
+  //    memref::createFoldMemRefAliasOpsPass());
+  //nestedModulePM.addPass(createCanonicalizerPass());
+  //nestedModulePM.addPass(createCSEPass());
+
   nestedModulePM.addNestedPass<func::FuncOp>(createLLVMGPUVectorToGPU(GPUTensorCoreType::MMA_SYNC));
   nestedModulePM.addPass(createCanonicalizerPass());
   nestedModulePM.addPass(createCSEPass());
@@ -577,13 +587,13 @@ void buildLLVMGPUTransformPassPipeline(OpPassManager &pm, bool useROCM) {
   // Hoist loop invariant code to avoid pipelining it.
   nestedModulePM.addNestedPass<func::FuncOp>(
       createLoopInvariantCodeMotionPass());
-  // Pipeline memory operations.
-  //nestedModulePM.addNestedPass<func::FuncOp>(createGPUPipeliningPass(
-  //    /*epiloguePeeling=*/false, pipelineDepth,
-  //    PipeliningSchedulingStrategy::loadGlobalStage0));
   // Optimize shared memory usage.
   nestedModulePM.addNestedPass<func::FuncOp>(
       createLLVMGPUPackSharedMemoryAlloc());
+  // Pipeline memory operations.
+  nestedModulePM.addNestedPass<func::FuncOp>(createGPUPipeliningPass(
+      /*epiloguePeeling=*/false, pipelineDepth,
+      PipeliningSchedulingStrategy::loadGlobalStage0));
 
   //===--------------------------------------------------------------------===//
   // Convert Linalg ops to LLVM+NVVM/ROCDL ops.

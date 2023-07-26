@@ -79,7 +79,11 @@ struct LLVMGPUPackSharedMemoryAllocPass
     SmallVector<AliasGroup> aliasGroups;
     analyseAllocsForPacking(funcOp, allocs, aliasGroups);
     // If there is 1 or less alias group there is nothing to do.
-    if (aliasGroups.size() <= 1) return;
+    if (aliasGroups.size() <= 1) {
+        printf("aliasGroup size = %zu\n", aliasGroups.size());
+        printf("failed 1\n");
+        return;
+    }
 
     // Pack all the allocations into one i8 alloc.
     // We may need to add extra barriers to make sure we are done writting or

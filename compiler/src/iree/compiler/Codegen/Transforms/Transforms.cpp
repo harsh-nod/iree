@@ -635,6 +635,7 @@ void analyseAllocsForPacking(func::FuncOp funcOp, ArrayRef<Operation *> allocs,
   Liveness liveness(funcOp);
   SmallVector<AllocGroup> groups;
   for (Operation *alloc : allocs) {
+    alloc->dump();
     SmallVector<size_t> aliasGroups;
     for (size_t i : llvm::seq<size_t>(0, groups.size())) {
       AllocGroup &group = groups[i];
@@ -642,6 +643,7 @@ void analyseAllocsForPacking(func::FuncOp funcOp, ArrayRef<Operation *> allocs,
         // Skip the whole analysis if any user is a subview.
         // TODO: This could be extended if needed by recursively merging
         // liveness.
+        user->dump();
         if (isa<memref::SubViewOp>(user)) return;
         if (group.liveness.count(user)) {
           aliasGroups.push_back(i);

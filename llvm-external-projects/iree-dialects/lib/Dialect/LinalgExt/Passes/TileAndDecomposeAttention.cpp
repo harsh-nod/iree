@@ -438,26 +438,28 @@ createAttentionBody(Value keySlice, Value valueSlice, Value querySlice,
   // Compute current statistics
   Value newMax = computeRowwiseReduction<arith::MaxFOp>(qkTranspose, maxSlice,
                                                         loc, builder, ops);
-  Value partialSoftmax =
-      computePartialSoftmax(qkTranspose, newMax, loc, builder, ops);
   Value scaleFactor = computeScaleFactor(maxSlice, newMax, loc, builder, ops);
   Value scaledOldSum =
       updateAndScale(scaleFactor, sumSlice, loc, builder, ops);
-  Value newSum = computeRowwiseReduction<arith::AddFOp>(
-      partialSoftmax, scaledOldSum, loc, builder, ops);
+  Value partialSoftmax =
+      computePartialSoftmax(qkTranspose, newMax, loc, builder, ops);
 
   ArrayRef<int64_t> softmaxShape = partialSoftmax.getType().cast<ShapedType>().getShape();
   Value scratch = builder.create<tensor::EmptyOp>(loc, resultShape, builder.getF16Type());
-  partialSoftmax = truncateToF16<2>(partialSoftmax, scratch, builder, loc, ops);
+  Value truncatedPartialSoftmax = truncateToF16<2>(partialSoftmax, scratch, builder, loc, ops);
 
   // Update accumulator
   Value scaledAcc = scaleAccumulator(outputSlice, scaleFactor, loc, builder, ops);
 
   // Compute matmul(softmax, v)
   auto matmulOp = builder.create<linalg::MatmulOp>(
-      loc, scaledAcc.getType(), ValueRange{partialSoftmax, valueSlice}, scaledAcc);
+      loc, scaledAcc.getType(), ValueRange{truncatedPartialSoftmax, valueSlice}, scaledAcc);
   ops.push_back(matmulOp);
   Value result = matmulOp.getResult(0);
+
+  Value newSum = computeRowwiseReduction<arith::AddFOp>(
+      partialSoftmax, scaledOldSum, loc, builder, ops);
+
   return std::make_tuple(result, newMax, newSum);
 }
 

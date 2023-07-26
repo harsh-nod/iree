@@ -468,6 +468,15 @@ class CUDATargetBackend final : public TargetBackend {
                                         "dialect to the native llvm::Module";
       }
 
+      llvm::Type *i32 = llvm::Type::getInt32Ty(context);
+      llvm::Metadata *mdFour =
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::getSigned(i32, 4));
+      llvm::Metadata *mdName = llvm::MDString::get(context, "nvvm-reflect-ftz");
+      llvm::Metadata *mdOne =
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::getSigned(i32, 1));
+      llvm::MDNode *reflect = llvm::MDNode::get(context, {mdFour, mdName, mdOne});
+      llvmModule->addModuleFlag(reflect);
+
       for (auto [exportOp, workgroupSize] :
            llvm::zip_equal(variantOp.getOps<IREE::HAL::ExecutableExportOp>(),
                            workgroupSizes)) {
@@ -562,6 +571,14 @@ class CUDATargetBackend final : public TargetBackend {
       // final FlatBuffer.
       ptxImage = translateModuleToISA(*llvmModule, *targetMachine);
     }
+
+    //std::string maxInstruction{"sub.rn.f32"};
+    //std::string newMaxInstruction{"sub.f32"};
+    //size_t pos = ptxImage.find(maxInstruction);
+    //while (pos != std::string::npos) {
+    //  ptxImage.replace(pos, maxInstruction.size(), newMaxInstruction);
+    //  pos = ptxImage.find(maxInstruction, pos + newMaxInstruction.size());
+    //}
 
     if (dumpPtx) {
       llvm::dbgs() << ptxImage;

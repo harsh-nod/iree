@@ -931,9 +931,14 @@ static bool isVectorId(int dimType) {
 bool resolveLayoutConficts(Value vector,
                            DenseMap<Value, Layout> &layoutMap,
                            DenseMap<Value, Layout> &layoutConflicts,
-                           DenseMap<Value, Value> &simdToSimtMap, Location loc,
+                           DenseMap<Value, Value> &simdToSimtMap,
+                           DenseMap<Value, SmallVector<Value>> &multipleLayoutMappings,
+                           Location loc,
                            OpBuilder &rewriter) {
   if (!layoutConflicts.contains(vector)) return true;
+  if (!multipleLayoutMappings.contains(vector)) {
+    multipleLayoutMappings.try_emplace(vector, SmallVector<Value>{simdToSimtMap.at(vector)});
+  }
   Layout currentLayout = layoutMap.at(vector);
   Layout targetLayout = layoutConflicts.at(vector);
   currentLayout.debugPrint("!!conflict!! current ");
@@ -1040,6 +1045,8 @@ bool resolveLayoutConficts(Value vector,
   layoutMap.try_emplace(vector, newLayout);
   newLayout.debugPrint("updated layout");
   layoutConflicts.erase(vector);
+  // Add new value to multiple layout mapping
+  multipleLayoutMappings[vector].push_back(simdToSimtMap.at(vector));
   return true;
 }
 
@@ -1201,12 +1208,136 @@ static void iterate(int dimType, ArrayRef<int> order,
   }
 }
 
+static std::tuple<SmallVector<Value>, SmallVector<Type>> extractOperandSlices(SmallVector<Value> &newOperands,
+        const Layout &layout, VectorType simtResultType,
+        DenseMap<Value, Value> &operand2DTo1DMap, OpBuilder &rewriter, Location loc) {
+  auto parallelOrder = layout.order[!layout.reductionDim];
+  // Extract only the relevant part of the input operands
+  SmallVector<int64_t> oneDimensionalShape(2, 1);
+  for (int dim : parallelOrder) {
+    if (isLaneId(dim)) continue;
+    if (isBatchId(dim)) {
+      oneDimensionalShape[0] = layout.shape[dim];
+    }
+    // Handle VecZ * VecY scenario
+    if (isVectorId(dim)) {
+      if (dim == DimType::VecIdX) {
+        oneDimensionalShape[1] = layout.shape[dim];
+      } else {
+        oneDimensionalShape[1] *= layout.shape[dim];
+      }
+    }
+  }
+  auto newVecType = VectorType::get(oneDimensionalShape, simtResultType.getElementType());
+  SmallVector<Value> new1dOperands;
+  for (auto operand : newOperands) {
+    // Check if operand has been processed
+    if (operand2DTo1DMap.contains(operand)) {
+      new1dOperands.push_back(operand2DTo1DMap.at(operand));
+      continue;
+    }
+    // If operand has same shape as desired type it is a result,
+    // so no need for extract
+    auto operandType = operand.getType().cast<VectorType>();
+    SmallVector<int64_t> operandShape(operandType.getShape());
+    if (operandShape == oneDimensionalShape) {
+      new1dOperands.push_back(operand);
+      continue;
+    }
+    Value newOperand = rewriter.create<arith::ConstantOp>(
+      loc, newVecType, rewriter.getZeroAttr(newVecType));
+    bodyType extractSlice = [&](std::array<int, DimType::NumDims> &state) {
+      Value element = rewriter.create<vector::ExtractOp>(
+            loc, operand,
+            SmallVector<int64_t>{state[DimType::Batch0], state[DimType::Batch1],
+              state[DimType::VecIdY] * layout.shape[DimType::VecIdZ] + state[DimType::VecIdZ],
+              state[DimType::VecIdX]});
+      SmallVector<int64_t> indices(2, 0);
+      for (int dim : parallelOrder) {
+        if (isLaneId(dim)) continue;
+        if (isBatchId(dim)) {
+          indices[0] = dim == DimType::Batch0 ? state[DimType::Batch0] : state[DimType::Batch1];
+        }
+        if (isVectorId(dim)) {
+          indices[1] = dim == DimType::VecIdX ? state[DimType::VecIdX] :
+                                                     state[DimType::VecIdY] * layout.shape[DimType::VecIdZ] + state[DimType::VecIdZ];
+        }
+      }
+      newOperand = rewriter.create<vector::InsertOp>(loc, element, newOperand, indices);
+    };
+    std::array<int, DimType::NumDims> state;
+    state.fill(0);
+    iterate(0, parallelOrder, state, layout, extractSlice);
+    new1dOperands.push_back(newOperand);
+    operand2DTo1DMap.try_emplace(operand, newOperand);
+  }
+  return std::make_pair(new1dOperands, SmallVector<Type>{newVecType});
+}
+
+static Value broadcastResultTo2D(Value newResult,
+        const Layout &layout, VectorType simtResultType, OpBuilder &rewriter, Location loc) {
+  auto parallelOrder = layout.order[!layout.reductionDim];
+  auto reductionOrder = layout.order[layout.reductionDim];
+  Value newBroadcastedResult = rewriter.create<arith::ConstantOp>(
+    loc, simtResultType, rewriter.getZeroAttr(simtResultType));
+  // Broadcast the result back to original shape
+  bodyType broadcastResult = [&](std::array<int, DimType::NumDims> &state) {
+      SmallVector<int64_t> indices(2, 0);
+      for (int dim : parallelOrder) {
+        if (isLaneId(dim)) continue;
+        if (isBatchId(dim)) {
+          indices[0] = dim == DimType::Batch0 ? state[DimType::Batch0] : state[DimType::Batch1];
+        }
+        if (isVectorId(dim)) {
+          indices[1] = dim == DimType::VecIdX ? state[DimType::VecIdX] :
+                                                     state[DimType::VecIdY] * layout.shape[DimType::VecIdZ] + state[DimType::VecIdZ];
+        }
+      }
+    Value element = rewriter.create<vector::ExtractOp>(loc, newResult, indices);
+    auto broadcastResult = [&](std::array<int, DimType::NumDims> &state) {
+      newBroadcastedResult = rewriter.create<vector::InsertOp>(
+          loc, element, newBroadcastedResult,
+          SmallVector<int64_t>{
+              state[DimType::Batch0], state[DimType::Batch1],
+              state[DimType::VecIdY] * layout.shape[DimType::VecIdZ] +
+                  state[DimType::VecIdZ],
+              state[DimType::VecIdX]});
+    };
+    // Broadcast result to same shape as original
+    iterate(0, reductionOrder, state, layout, broadcastResult);
+  };
+  std::array<int, DimType::NumDims> state;
+  state.fill(0);
+  iterate(0, parallelOrder, state, layout, broadcastResult);
+  return newBroadcastedResult;
+}
+
+VectorType recover2DShape(Operation *op, SmallVector<SmallVector<Operation *>> &regions,
+                          DenseMap<Value, Value> &operand2DTo1DMap,
+                          DenseMap<Value, Value> &simdToSimtMap) {
+  for (auto region : regions) {
+    if (op == region.back()) {
+      Operation *first = region.front();
+      for (auto [operand2D, operand1D] : operand2DTo1DMap) {
+        for (auto operand : first->getOperands()) {
+          if (simdToSimtMap.at(operand) == operand2D) {
+            return operand2D.getType().cast<VectorType>();
+          }
+        }
+      }
+    }
+  }
+  return VectorType();
+}
+
 static void distributeElementwise(Operation *op,
                                   DenseMap<Value, Layout> &layoutMap,
                                   DenseMap<Value, Value> &simdToSimtMap,
                                   OpBuilder &rewriter,
                                   llvm::SetVector<Operation *> &ops,
-                                  DenseMap<Value, Layout> &layoutConflicts) {
+                                  DenseMap<Value, Layout> &layoutConflicts,
+                                  SmallVector<SmallVector<Operation *>> &regions,
+                                  DenseMap<Value, SmallVector<Value>> &multipleLayoutMappings) {
   if (!OpTrait::hasElementwiseMappableTraits(op)) return;
   if (op->getNumResults() != 1) return;
   if (simdToSimtMap.count(op->getResult(0))) return;
@@ -1227,7 +1358,7 @@ static void distributeElementwise(Operation *op,
   Location loc = op->getLoc();
   for (auto operand : op->getOperands()) {
     if (!simdToSimtMap.count(operand)) return;
-    if (!resolveLayoutConficts(operand, layoutMap, layoutConflicts, simdToSimtMap,
+    if (!resolveLayoutConficts(operand, layoutMap, layoutConflicts, simdToSimtMap, multipleLayoutMappings,
                                loc, rewriter)) return;
     newOperands.push_back(simdToSimtMap.at(operand));
   }
@@ -1238,11 +1369,59 @@ static void distributeElementwise(Operation *op,
     simtResultType = VectorType::get(simtOperandType.getShape(), simdResultType.getElementType());
   }
   SmallVector<Type> resultTypes{simtResultType};
+  // If the result is 1d, the operands must also be 1d
+  Value result = op->getResult(0);
+  if (!layoutMap.count(result)) return;
+  Layout layout = layoutMap.at(result);
+  bool oneDimensional = layout.rank == 1;
+  bool emitBroadcast{false};
+  bool withinRegion{false};
+  for (auto region : regions) {
+    llvm::SetVector<Operation *> regionSet(region.begin(), region.end());
+    if (regionSet.contains(op)) {
+      withinRegion = true;
+    }
+    if ((region.back() == op) && (region.front() != op)) {
+      emitBroadcast = true;
+      break;
+    }
+  }
+  static DenseMap<Value, Value> operand2DTo1DMap;
+  if (oneDimensional && withinRegion) {
+    std::tie(newOperands, resultTypes) = extractOperandSlices(newOperands, layout, simtResultType, operand2DTo1DMap, rewriter, loc);
+  }
   Operation *newOp =
       rewriter.create(op->getLoc(), op->getName().getIdentifier(), newOperands,
                       resultTypes, op->getAttrs());
-  Value result = op->getResult(0);
-  simdToSimtMap.try_emplace(result, newOp->getResult(0));
+  Value newResult = newOp->getResult(0);
+  if (oneDimensional && emitBroadcast) {
+    VectorType simtResultType = recover2DShape(op, regions, operand2DTo1DMap, simdToSimtMap);
+    newResult = broadcastResultTo2D(newResult, layout, simtResultType, rewriter, loc);
+    // At the end of region, broadcast any other 2D results
+    SmallVector<Value> toBroadcast;
+    for (auto region : regions) {
+      // Find the appropriate region
+      if ((region.back() == op) && (region.front() != op)) {
+        llvm::SetVector<Operation *> regionSet(region.begin(), region.end());
+        for (int i = 0; i < region.size() - 1; i++) {
+          Value result = region[i]->getResult(0);
+          for (auto user : result.getUsers()) {
+            if (!regionSet.contains(user)) {
+              toBroadcast.push_back(result);
+              break;
+            }
+          }
+        }
+      }
+    }
+    for (auto operand : toBroadcast) {
+      if (simdToSimtMap.contains(operand)) {
+        Value broadcastedOperand = broadcastResultTo2D(simdToSimtMap.at(operand), layout, simtResultType, rewriter, loc);
+        simdToSimtMap[operand] = broadcastedOperand;
+      }
+    }
+  }
+  simdToSimtMap.try_emplace(result, newResult);
   ops.insert(op);
 }
 
@@ -1251,7 +1430,9 @@ static void distributeReductionBroadcastTranspose(
     vector::MultiDimReductionOp reductionOp, vector::BroadcastOp broadcastOp,
     vector::TransposeOp transposeOp, DenseMap<Value, Layout> &layoutMap,
     DenseMap<Value, Value> &simdToSimtMap, OpBuilder &rewriter,
-    llvm::SetVector<Operation *> &ops, DenseMap<Value, Layout> &layoutConflicts) {
+    llvm::SetVector<Operation *> &ops, DenseMap<Value, Layout> &layoutConflicts,
+    SmallVector<SmallVector<Operation *>> &regions,
+    DenseMap<Value, SmallVector<Value>> &multipleLayoutMappings) {
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(reductionOp);
   Value source = reductionOp.getSource();
@@ -1268,11 +1449,35 @@ static void distributeReductionBroadcastTranspose(
   vector::CombiningKind combiningKind = reductionOp.getKind();
   // Only support reduction on one dimension
   if (reductionDims.size() > 1) return;
+  Value acc = reductionOp.getAcc();
+  if (!simdToSimtMap.count(acc)) return;
+
+  Layout accLayout = layoutMap.at(acc);
+  Value simtAcc = simdToSimtMap.at(acc);
+  Value simtSrc = simdToSimtMap.at(source);
+  // Indicates usage of a value with another layout
+  if (layout != accLayout) {
+    bool success{false};
+    if (multipleLayoutMappings.count(source)) {
+      for (Value vector : multipleLayoutMappings.at(source)) {
+        if (vector != simtSrc) {
+          // TODO: Need to compare layouts
+          // Use first layout that's different
+          simtSrc = vector;
+          success = true;
+          break;
+        }
+      }
+    }
+    if (!success) return;
+    // Use the accumulator layout
+    layout = accLayout;
+  }
+
   int reductionDim = reductionDims[0].getInt();
   std::array<int, 4> reductionOrder = layout.order[reductionDim];
   std::array<int, 4> parallelOrder = layout.order[!reductionDim];
-  Value acc = reductionOp.getAcc();
-  if (!simdToSimtMap.count(acc)) return;
+
   SmallVector<int64_t> vecShape{
       layout.shape[DimType::Batch0], layout.shape[DimType::Batch1],
       layout.shape[DimType::VecIdZ] * layout.shape[DimType::VecIdY],
@@ -1298,7 +1503,7 @@ static void distributeReductionBroadcastTranspose(
   }
 
   bodyType loopBody = [&](std::array<int, DimType::NumDims> &state) {
-    Value vector = simdToSimtMap.at(source);
+    Value vector = simtSrc;
     VectorType vType = vector.getType().cast<VectorType>();
     Type elementType = vType.getElementType();
     int bitWidth = elementType.getIntOrFloatBitWidth();
@@ -1306,7 +1511,7 @@ static void distributeReductionBroadcastTranspose(
     Value mask;
 
     Value accValue = rewriter.create<vector::ExtractOp>(
-          loc, simdToSimtMap.at(acc),
+          loc, simtAcc,
           SmallVector<int64_t>{state[DimType::Batch0], state[DimType::Batch1],
             state[DimType::VecIdY] * layout.shape[DimType::VecIdZ] + state[DimType::VecIdZ],
             state[DimType::VecIdX]});
@@ -1408,7 +1613,7 @@ static void distributeReductionBroadcastTranspose(
   ops.insert(reductionOp);
   Operation *parentOp = broadcastOp.getSource().getDefiningOp();
   if (OpTrait::hasElementwiseMappableTraits(parentOp)) {
-    distributeElementwise(parentOp, layoutMap, simdToSimtMap, rewriter, ops, layoutConflicts);
+    distributeElementwise(parentOp, layoutMap, simdToSimtMap, rewriter, ops, layoutConflicts, regions, multipleLayoutMappings);
     simdToSimtMap.try_emplace(transposeOp.getResult(), simdToSimtMap.at(parentOp->getResult(0)));
   } else if (dyn_cast<scf::ForOp>(parentOp)) {
   } else {
@@ -1621,12 +1826,38 @@ void doLayoutAnalysisAndDistribution(IRRewriter &rewriter,
     return WalkResult::advance();
   });
 
+  // Identify one dimensional regions
+  SmallVector<SmallVector<Operation *>> regions;
+  funcOp.walk([&](Operation *op) {
+    if (!OpTrait::hasElementwiseMappableTraits(op)) return WalkResult::advance();
+    Value result = op->getResult(0);
+    if (!layoutMap.count(result)) return WalkResult::advance();
+    ShapedType resultType = result.getType().cast<ShapedType>();
+    if (resultType.getRank() > 1) return WalkResult::advance();
+    bool foundTerminator{false};
+    for (auto &region : regions) {
+      for (auto operand : op->getOperands()) {
+        if (region.back() == operand.getDefiningOp()) {
+          region.push_back(op);
+          foundTerminator = true;
+          break;
+        }
+      }
+    }
+    if (!foundTerminator) {
+      // Create a new region with no terminator
+      regions.push_back(SmallVector<Operation*>{op});
+    }
+    return WalkResult::advance();
+  });
+
   // Apply SIMD to SIMT conversion
   DenseMap<Value, Value> simdToSimtMap;
   llvm::SetVector<Operation *> opsToErase;
   SmallVector<Operation *> opsToTraverse;
   collectOperations(funcOp, opsToTraverse);
 
+  DenseMap<Value, SmallVector<Value>> multipleLayoutMappings;
   for (Operation *op : opsToTraverse) {
     if (auto readOp = dyn_cast<vector::TransferReadOp>(op)) {
       distributeTransferReads(readOp, layoutMap, simdToSimtMap, rewriter,
@@ -1647,7 +1878,7 @@ void doLayoutAnalysisAndDistribution(IRRewriter &rewriter,
         if (!result) {
           distributeReductionBroadcastTranspose(
               reductionOp, broadcastOp, transposeOp, layoutMap, simdToSimtMap,
-              rewriter, opsToErase, layoutConflicts);
+              rewriter, opsToErase, layoutConflicts, regions, multipleLayoutMappings);
           result = transposeOp.getResult();
         } else {
           simdToSimtMap.try_emplace(transposeOp.getResult(), simdToSimtMap.at(result));
@@ -1676,7 +1907,7 @@ void doLayoutAnalysisAndDistribution(IRRewriter &rewriter,
           distributeInnerBroadcast(broadcastOp, transposeOp, layoutMap, simdToSimtMap, rewriter, opsToErase, layoutConflicts);
       }
     }
-    distributeElementwise(op, layoutMap, simdToSimtMap, rewriter, opsToErase, layoutConflicts);
+    distributeElementwise(op, layoutMap, simdToSimtMap, rewriter, opsToErase, layoutConflicts, regions, multipleLayoutMappings);
   }
 
   // Erase old ops

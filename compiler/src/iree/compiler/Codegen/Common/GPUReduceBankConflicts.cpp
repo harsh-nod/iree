@@ -38,6 +38,13 @@ static void padAlloc(MLIRContext *context, memref::AllocOp allocOp,
   Value subview = rewriter.create<memref::SubViewOp>(
       loc, paddedAlloc, offsets, allocOp.getType().getShape(), strides);
   replaceMemrefUsesAndPropagateType(rewriter, loc, allocOp, subview);
+  for (OpOperand &use : subview.getUses()) {
+    Operation *user = use.getOwner();
+    if (isa<memref::DeallocOp>(user)) {
+      rewriter.eraseOp(user);
+      break;
+    }
+  }
   rewriter.eraseOp(allocOp);
 }
 
@@ -69,8 +76,11 @@ struct GPUReduceBankConflictsPass
         sharedMemAllocs.push_back(allocOp);
       }
     });
-    for (memref::AllocOp alloc : sharedMemAllocs)
-      padAlloc(context, alloc, paddingSizeBits);
+    int i = 0;
+    for (memref::AllocOp alloc : sharedMemAllocs) {
+      if (i == 2) padAlloc(context, alloc, paddingSizeBits);
+      i++;
+    }
   }
 };
 }  // namespace
