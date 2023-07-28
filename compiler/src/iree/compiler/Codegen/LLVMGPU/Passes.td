@@ -60,6 +60,12 @@ def LLVMGPUPackSharedMemoryAlloc :
   let constructor = "mlir::iree_compiler::createLLVMGPUPackSharedMemoryAlloc()";
 }
 
+def LLVMGPUScheduler :
+    Pass<"iree-llvmgpu-scheduler", "func::FuncOp"> {
+  let summary = "Pass to reorder operations for better performance.";
+  let constructor = "mlir::iree_compiler::createLLVMGPUSchedulerPass()";
+}
+
 def LLVMGPUTensorCoreVectorization :
     Pass<"iree-llvmgpu-tensorcore-vectorization", "func::FuncOp"> {
   let summary = "Pass to convert linalg into Vector and transform it to a form that can be lowered to GPU MMA ops";

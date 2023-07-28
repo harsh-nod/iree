@@ -78,6 +78,10 @@ createLLVMGPULowerExecutableTargetPass();
 std::unique_ptr<OperationPass<func::FuncOp>>
 createLLVMGPUPackSharedMemoryAlloc();
 
+/// Reorder operations within the graph for better performance.
+std::unique_ptr<OperationPass<func::FuncOp>>
+createLLVMGPUSchedulerPass();
+
 enum class GPUTensorCoreType {
   WMMA = 0,
   MMA_SYNC = 1,

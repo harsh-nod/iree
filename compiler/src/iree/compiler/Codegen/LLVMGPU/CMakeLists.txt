@@ -55,6 +55,7 @@ iree_cc_library(
     "LLVMGPUCastAddressSpaceFunction.cpp"
     "LLVMGPULowerExecutableTarget.cpp"
     "LLVMGPUPackSharedMemoryAlloc.cpp"
+    "LLVMGPUScheduler.cpp"
     "LLVMGPUTensorCoreVectorization.cpp"
     "LLVMGPUTensorPad.cpp"
     "LLVMGPUTileAndDistribute.cpp"
