@@ -93,8 +93,6 @@ static SmallVector<Operation *> createCompositeNode(Operation *op, DenseSet<Oper
   if (isa<vector::LoadOp>(op)) {
     for (Operation *user : op->getUsers()) {
       if (auto insertOp = dyn_cast<vector::InsertStridedSliceOp>(user)) {
-        llvm::dbgs() << "Got an insert op!\n";
-        insertOp.dump();
         groupedOps.push_back(insertOp);
         auto offsets = insertOp.getOffsets();
 
@@ -113,11 +111,9 @@ static SmallVector<Operation *> createCompositeNode(Operation *op, DenseSet<Oper
 
         // Find matching extract ops
         for (Operation *endUser : insertOp->getUsers()) {
-          endUser->dump();
           if (isExtracted(endUser, offsets)) {
             // Replace op with new op that uses the intermediate insert result
             auto extractOp = dyn_cast<vector::ExtractOp>(endUser);
-            extractOp.dump();
             auto insertOp = dyn_cast<vector::InsertStridedSliceOp>(groupedOps.back());
             ignore.insert(extractOp);
             extractOp.setOperand(insertOp.getResult());
@@ -145,8 +141,10 @@ static bool isNodeReadyToSchedule(Node::Ptr node, SmallVector<Operation *> &unsc
     // within an unscheduled op
     do {
       if (std::find(unscheduledNodes.begin(), unscheduledNodes.end(), parent) != unscheduledNodes.end()) {
-        llvm::dbgs() << "Not scheduled because this op has not been scheduled yet ...\n";
-        parent->dump();
+        LLVM_DEBUG({
+          llvm::dbgs() << "Not scheduled because this op has not been scheduled yet ...\n";
+          parent->dump();
+        });
         return false;
       }
       if (operatorToNode[parent] == node) {
@@ -181,7 +179,6 @@ static bool prioritizedTopologicalSort(Block *block) {
   llvm::iterator_range<Block::iterator> ops = block->without_terminator();
   if (ops.empty()) return true;
 
-  block->dump();
   // Create simple and composite nodes for ops
   DenseSet<Operation *> unscheduledOps, ignoreOps;
   DenseMap<Operation *, Node::Ptr> operationToNode;
@@ -195,39 +192,42 @@ static bool prioritizedTopologicalSort(Block *block) {
   unscheduledGraphs.push_back(Graph());
 
   for (Operation &op : ops) {
-    llvm::dbgs() << "Processing ... \n";
+    LLVM_DEBUG({ llvm::dbgs() << "Processing ... \n"; });
     if (unscheduledOps.contains(&op)) {
+      LLVM_DEBUG({
       llvm::dbgs() << "Already in unscheduled!\n";
       op.dump();
+      });
       continue;
     }
     if (ignoreOps.contains(&op)) {
+      LLVM_DEBUG({
       llvm::dbgs() << "in ignore list!\n";
       op.dump();
+      });
       continue;
     }
     if (hasReadWriteEffects(&op)) {
+      LLVM_DEBUG({
       llvm::dbgs() << "has read/write effects\n";
       op.dump();
+      });
       auto compositeNode = std::make_shared<Node>();
       compositeNode->ops = createCompositeNode(&op, ignoreOps);
-      llvm::dbgs() << "----------\n";
       for (Operation *child : compositeNode->ops) {
         operationToNode[child] = compositeNode;
         unscheduledOps.insert(child);
         unscheduledGraphs.back().nodes.push_back(child);
-        child->dump();
       }
       nodes.push_back(compositeNode);
       if (compositeNode->ops.size() > 1)
         unscheduledGraphs.back().freeze = false;
-      llvm::dbgs() << "----------\n";
       continue;
     }
     if (isGraphBreak(&op)) {
       unscheduledGraphs.push_back(Graph());
     }
-    op.dump();
+
     auto newNode = std::make_shared<Node>();
     newNode->ops.push_back(&op);
     unscheduledOps.insert(&op);
@@ -236,6 +236,7 @@ static bool prioritizedTopologicalSort(Block *block) {
     unscheduledGraphs.back().nodes.push_back(&op);
   }
 
+  LLVM_DEBUG({
   llvm::dbgs() << "Partitioned graph into " << unscheduledGraphs.size() << " subgraphs \n";
   for (Graph graph : unscheduledGraphs) {
     if (graph.freeze) {
@@ -244,6 +245,7 @@ static bool prioritizedTopologicalSort(Block *block) {
       llvm::dbgs() << "Graph is not frozen\n";
     }
   }
+  });
 
   // Assign costs to nodes, starting with mfmas
   // The lower the cost, the higher the priority
@@ -252,13 +254,11 @@ static bool prioritizedTopologicalSort(Block *block) {
   int barrierCost{-1};
   std::map<Node::Ptr, int> nodeCost;
   std::map<Operation *, int> opCost;
+  DenseSet<Operation *> prioritizedElemwiseOps;
   for (Node::Ptr node : nodes) {
     for (Operation *op : node->ops) {
       if (auto mfmaOp = dyn_cast<amdgpu::MFMAOp>(op)) {
-        op->dump();
-        llvm::dbgs() << "MFMA op = ";
         nodeCost[node] = count + offset;
-        llvm::dbgs() << "Node cost = " << nodeCost[node] << "\n";
         Operation *parentA = mfmaOp.getSourceA().getDefiningOp();
         Operation *parentB = mfmaOp.getSourceB().getDefiningOp();
         Operation *parentC = mfmaOp.getDestC().getDefiningOp();
@@ -270,6 +270,34 @@ static bool prioritizedTopologicalSort(Block *block) {
         nodeCost[node] = barrierCost;
         break;
       }
+      if (auto affineApplyOp = dyn_cast<affine::AffineApplyOp>(op)) {
+        nodeCost[node] = 6;
+        break;
+      }
+      if (auto constantOp = dyn_cast<arith::ConstantOp>(op)) {
+        nodeCost[node] = 4;
+        break;
+      }
+      if (auto loadGlobalOp = dyn_cast<vector::TransferReadOp>(op)) {
+        nodeCost[node] = 7;
+        break;
+      }
+      if (OpTrait::hasElementwiseMappableTraits(op)) {
+        bool highPriority{true};
+        for (auto operand : op->getOperands()) {
+          Operation *constantOp = operand.getDefiningOp<arith::ConstantOp>();
+          Operation *threadIdOp = operand.getDefiningOp<gpu::ThreadIdOp>();
+          Operation *affineApplyOp = operand.getDefiningOp<affine::AffineApplyOp>();
+          Operation *parent = operand.getDefiningOp();
+          if (constantOp || threadIdOp || affineApplyOp || !parent || prioritizedElemwiseOps.contains(parent)) continue;
+          highPriority = false;
+          break;
+        }
+        if (highPriority) {
+          prioritizedElemwiseOps.insert(op);
+          nodeCost[node] = 5;
+        }
+      }
     }
   }
 
@@ -278,42 +306,17 @@ static bool prioritizedTopologicalSort(Block *block) {
     if (nodeCost.count(node)) continue;
     for (Operation *op : node->ops) {
       if (opCost.count(op)) {
-        op->dump();
-        llvm::dbgs() << "MFMA Dependency op = ";
         nodeCost[node] = opCost[op];
-        llvm::dbgs() << "Node cost = " << nodeCost[node] << "\n";
         break;
       } else {
-        op->dump();
-        llvm::dbgs() << "Ordinary op = ";
         nodeCost[node] = baselineValue;
-        llvm::dbgs() << "Node cost = " << nodeCost[node] << "\n";
       }
     }
   }
 
-  llvm::dbgs() << "Begin scheduling\n";
   Block::iterator nextScheduledOp = ops.begin();
-  //Block::iterator endOp = ops.end();
-  llvm::dbgs() << "Before ...\n";
-  block->dump();
-  llvm::dbgs() << "----------\n";
   for (Graph graph : unscheduledGraphs) {
     if (graph.freeze) {
-      llvm::dbgs() << "Encountered frozen graph. Forwarding iterator ...\n";
-      llvm::dbgs() << "Here are the ops in the current graph ... \n";
-      for (Operation *op : graph.nodes) {
-        op->dump();
-      }
-      llvm::dbgs() << "====================\n";
-      for (Operation *op : graph.nodes) {
-        llvm::dbgs() << " current op = \n";
-        op->dump();
-        llvm::dbgs() << " nextScheduledOp = \n";
-        nextScheduledOp->dump();
-        if (op == &*nextScheduledOp) nextScheduledOp++;
-      }
-      llvm::dbgs() << "====================\n";
       continue;
     }
     while (!graph.nodes.empty()) {
@@ -321,14 +324,18 @@ static bool prioritizedTopologicalSort(Block *block) {
         Node::Ptr minCostNode{nullptr};
         for (Operation *op : graph.nodes) {
           Node::Ptr node = operationToNode[op];
+          LLVM_DEBUG({
           llvm::dbgs() << "Attempting to schedule ... \n";
           op->dump();
+          });
           if (!isNodeReadyToSchedule(node, graph.nodes, operationToNode)) {
+            LLVM_DEBUG({
             llvm::dbgs() << "Op not ready to be scheduled \n";
             for (Operation *nodeOp : node->ops) {
               nodeOp->dump();
             }
             llvm::dbgs() << "----------\n";
+            });
             continue;
           }
           if (!minCostNode) {
@@ -339,14 +346,18 @@ static bool prioritizedTopologicalSort(Block *block) {
           }
         }
 
+        LLVM_DEBUG({
         llvm::dbgs() << " nextScheduledOp = \n";
         nextScheduledOp->dump();
+        });
 
         // Schedule the operation by moving it to the start
         for (Operation *nodeOp : minCostNode->ops) {
+          LLVM_DEBUG({
           llvm::dbgs() << "Scheduling ...\n";
           nodeOp->dump();
           llvm::dbgs() << "----------\n";
+          });
           nodeOp->moveBefore(block, nextScheduledOp);
           auto it = std::find(graph.nodes.begin(), graph.nodes.end(), nodeOp);
           if (it == graph.nodes.end())
@@ -355,33 +366,41 @@ static bool prioritizedTopologicalSort(Block *block) {
           if (nodeOp == &*nextScheduledOp)
             ++nextScheduledOp;
         }
+        LLVM_DEBUG({
         llvm::dbgs() << "After ...\n";
         block->dump();
         llvm::dbgs() << "----------\n";
+        });
     }
   }
+  return true;
+}
 
-  // Create a new dependency graph
-  //std::vector<Graph::Ptr> graphs;
-  //graphs.push_back(std::make_shared<Graph>());
-  //for (Operation &op : ops) {
-  //  llvm::dbgs() << "--------\n";
-  //  if (isGraphBreak(&op)) {
-  //    graphs.push_back(std::make_shared<Graph>());
-  //    continue;
-  //  }
-  //  if (isa<vector::LoadOp>(op) || isa<vector::StoreOp>(op))
-  //    graphs.back()->freeze = false;
-  //}
-
-  llvm::dbgs() << "--------------------\n";
-
-  // First, create new nodes
-
-  return false;
+static bool insertBarriers(Block *block) {
+  auto barrierOps = SmallVector<Operation *>(block->getOps<gpu::BarrierOp>());
+  if (barrierOps.size() == 0) return true;
+  IRRewriter rewriter(barrierOps[0]->getContext());
+  // Erase all barriers inside
+  for (auto barrierOp : barrierOps)
+    rewriter.eraseOp(barrierOp);
+  // Add barrier after compute
+  auto mfmaOps = SmallVector<Operation *>(block->getOps<amdgpu::MFMAOp>());
+  if (mfmaOps.size() == 0) return true;
+  Location loc = mfmaOps.back()->getLoc();
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPointAfter(mfmaOps.back());
+  rewriter.create<gpu::BarrierOp>(loc);
+  // Add barrier before global read
+  auto globalLoads = SmallVector<Operation *>(block->getOps<vector::TransferReadOp>());
+  if (globalLoads.size() == 0) return true;
+  rewriter.setInsertionPointAfter(globalLoads.back());
+  rewriter.create<gpu::BarrierOp>(loc);
+  return true;
 }
 
 void scheduleOperations(func::FuncOp funcOp) {
+  IRRewriter rewriter(funcOp.getContext());
+
   SmallVector<scf::ForOp> forOps;
   funcOp.walk([&](Operation *op) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
@@ -393,7 +412,19 @@ void scheduleOperations(func::FuncOp funcOp) {
   // Only schedule body of inner-most for loop for now
   for (scf::ForOp forOp : forOps) {
     prioritizedTopologicalSort(&forOp.getLoopBody().front());
+    insertBarriers(&forOp.getLoopBody().front());
+    OpBuilder::InsertionGuard g(rewriter);
+    rewriter.setInsertionPointAfter(forOp);
+    rewriter.create<gpu::BarrierOp>(forOp.getLoc());
   }
+
+  funcOp.walk([&](gpu::BarrierOp op) {
+    if (op->hasAttr("__pipelining_first_stage__")) {
+      rewriter.eraseOp(op);
+    }
+    return WalkResult::advance();
+  });
+
 }
 
 } // namespace iree_compiler
