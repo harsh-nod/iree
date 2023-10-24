@@ -240,11 +240,36 @@ struct RewriteBarriers final
   }
 };
 
+struct MemrefStoreToBufferStore final
+  : public OpRewritePattern<memref::StoreOp> {
+  using OpRewritePattern<memref::StoreOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(memref::StoreOp op,
+                                PatternRewriter &rewriter) const override {
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(op);
+    SmallVector<Value> indices(op.getIndices().begin(), op.getIndices().end());
+    Value value = op.getValue();
+    Value source = op.getMemRef();
+    Location loc = op.getLoc();
+    Value sgprOffset = rewriter.create<arith::ConstantOp>(loc, rewriter.getI32IntegerAttr(0));
+    // Bitcast to integer
+    for (int i = 0; i < indices.size(); i++)
+      indices[i] = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), indices[i]);
+    rewriter.replaceOpWithNewOp<amdgpu::RawBufferStoreOp>(op, value, source,
+            indices, rewriter.getBoolAttr(false), rewriter.getI32IntegerAttr(0), sgprOffset);
+    return success();
+
+  }
+
+};
+
 } // namespace
 
 void populatePrepareVectorToAMDMMAPatterns(RewritePatternSet &patterns,
                                            bool useMfma) {
-  patterns.add<VectorTransferReadToLoad, VectorTransferWriteToStore, RewriteBarriers>(
+  patterns.add<VectorTransferReadToLoad, VectorTransferWriteToStore, RewriteBarriers,
+               MemrefStoreToBufferStore>(
       patterns.getContext());
 }
 
