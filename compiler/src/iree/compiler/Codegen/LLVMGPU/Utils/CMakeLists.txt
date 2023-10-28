@@ -22,6 +22,7 @@ iree_cc_library(
     "LLVMGPULayoutAnalysisAndDistribution.cpp"
     "LLVMGPULayoutVectorToGPU.cpp"
     "LLVMGPUOptimizeSharedMemoryReadsWrites.cpp"
+    "LLVMGPUPrefetching.cpp"
     "LLVMGPUScheduler.cpp"
     "LLVMGPUUtils.cpp"
   DEPS

@@ -8,6 +8,7 @@
 #define IREE_COMPILER_CODEGEN_LLVMGPU_UTILS_LLVMGPUUTILS_H_
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/PatternMatch.h"
 
 namespace mlir {
@@ -42,6 +43,9 @@ void populatePrepareVectorToAMDMMAPatterns(RewritePatternSet &patterns,
 void scheduleOperations(func::FuncOp funcOp);
 
 void optimizeSharedMemoryReadsAndWrites(func::FuncOp funcOp);
+
+FailureOr<scf::ForOp> prefetchSharedMemoryCopy(RewriterBase &rewriter,
+                                               scf::ForOp forOp);
 
 } // namespace iree_compiler
 } // namespace mlir
